@@ -74,10 +74,6 @@ static int blk_submit_and_wait(uint32_t cmd, uint32_t lba, uint32_t count, uint3
         done = g_blk_done;
         status = io_in32(IO_DISK_STATUS);
         if (status != DISK_STATUS_BUSY || done != 0u) {
-            /*
-             * Use status as source of truth: even if disk completion IRQ is lost,
-             * the operation is complete once DISK_STATUS leaves BUSY.
-             */
             g_blk_busy = 0u;
             g_blk_done = 0u;
             spinlock_unlock(&g_blk_lock);
@@ -86,18 +82,9 @@ static int blk_submit_and_wait(uint32_t cmd, uint32_t lba, uint32_t count, uint3
         if (quick_poll_budget < BLK_QUICK_POLL_ITERS) {
             quick_poll_budget++;
             spinlock_unlock(&g_blk_lock);
-            /*
-             * For short I/O completions, switching away on every poll costs more
-             * than the device latency itself, especially on single-core bring-up.
-             * Keep the first window as a pure poll loop and only sleep after it.
-             */
             continue;
         }
         quick_poll_budget = 0u;
-        /*
-         * Sleep with a short timeout so we periodically re-check DISK_STATUS
-         * even when no IRQ wakeup arrives.
-         */
         sched_waitq_sleep(&g_blk_waitq, 1u);
         spinlock_unlock(&g_blk_lock);
         sched_block_until_runnable();

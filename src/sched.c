@@ -522,6 +522,10 @@ sched_task_slot_t *sched_current_slot_fd_locked(void) {
         return 0;
     }
     spinlock_lock(&slot->fd_lock);
+    if (!slot->used) {
+        spinlock_unlock(&slot->fd_lock);
+        return 0;
+    }
     return slot;
 }
 
@@ -548,6 +552,29 @@ void sched_switch_current_to_scheduler(void) {
     g_sched_ctx[cpu_id].irq_masked = 0u;
     g_sched_ctx[cpu_id].in_interrupt = 0u;
     sched_ctx_swap(&slot->stack_ctx, &g_sched_ctx[cpu_id]);
+}
+
+void sched_save_current_user_irq_ctx(void) {
+    sched_task_slot_t *slot;
+    uint32_t saved_csp = irq_saved_user_csp();
+    uint32_t saved_dsp = irq_saved_user_dsp();
+    uint32_t saved_call_base = irq_saved_user_call_base();
+    uint32_t saved_data_base = irq_saved_user_data_base();
+
+    if (saved_csp > VM_CALL_STACK_ENTRIES || saved_dsp > VM_DATA_STACK_ENTRIES ||
+        saved_call_base == 0u || saved_data_base == 0u) {
+        return;
+    }
+
+    spinlock_lock(&g_sched_lock);
+    slot = sched_current_slot();
+    if (slot && slot->used && !slot->is_idle && slot->pub.kind == SCHED_TASK_KIND_USER) {
+        slot->saved_user_csp = saved_csp;
+        slot->saved_user_dsp = saved_dsp;
+        slot->saved_user_call_base = saved_call_base;
+        slot->saved_user_data_base = saved_data_base;
+    }
+    spinlock_unlock(&g_sched_lock);
 }
 
 static void sched_task_bootstrap(void) {
@@ -757,20 +784,6 @@ void sched_run(void) {
         *idx_ptr = next;
         slot->run_cpu = cpu_id;
         sched_runq_del(cpu_id, next);
-        if (slot->vfork_child_active != 0u || slot->vfork_resume_valid != 0u) {
-            klog_begin(KLOG_LEVEL_INFO, "sched");
-            klog_puts("run tid=");
-            klog_hex32(slot->pub.tid);
-            klog_puts(" state=");
-            klog_hex32(slot->pub.state);
-            klog_puts(" csp=");
-            klog_hex32(slot->stack_ctx.csp);
-            klog_puts(" vchild=");
-            klog_hex32(slot->vfork_child_active);
-            klog_puts(" vresume=");
-            klog_hex32(slot->vfork_resume_valid);
-            klog_end();
-        }
         if (slot->pub.kind == SCHED_TASK_KIND_KERNEL &&
             slot->stack_ctx.csp == VM_CALL_STACK_ENTRIES) {
             sched_stack_prepare_bootstrap_locked(slot);

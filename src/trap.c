@@ -80,7 +80,7 @@ static inline void irq_eoi_unlocked(uint32_t irq_no) {
     if (!g_intc_mmio_ready) {
         return;
     }
-    intc_write_eoi(irq_no);
+    *(volatile uint32_t *)(uintptr_t)(INTC_MMIO_BASE + INTC_REG_EOI) = irq_no;
 }
 
 static inline void ivt_write_entry(uint32_t irq_no, uintptr_t handler_addr) {

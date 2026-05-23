@@ -1,6 +1,7 @@
 #include "../include/kernel/blk.h"
 #include "../include/kernel/console.h"
 #include "../include/kernel/fs.h"
+#include "../include/kernel/irq.h"
 #include "../include/kernel/platform.h"
 #include "../include/kernel/printk.h"
 #include "../include/kernel/sched.h"
@@ -720,6 +721,29 @@ static uint32_t timeout_ms_to_ticks(int32_t timeout_ms) {
     return div_ceil_u32(timeout_us, tick_us);
 }
 
+static uint32_t syscall_console_wait_ready_spin(int32_t timeout_ms, uint32_t start_tick, uint32_t timeout_ticks) {
+    uint32_t spins = 0u;
+    for (;;) {
+        irq_serial_drain_rx();
+        if (console_can_read()) {
+            return 1u;
+        }
+        if (timeout_ms == 0) {
+            return 0u;
+        }
+        if (timeout_ms > 0) {
+            uint32_t elapsed = sched_ticks() - start_tick;
+            if (elapsed >= timeout_ticks) {
+                return 0u;
+            }
+            if (++spins > (timeout_ticks * 4096u + 4096u)) {
+                return 0u;
+            }
+        }
+        __asm__ volatile("pause\n" ::: "memory");
+    }
+}
+
 #define SYSCALL_PUBLISH_RESULT(regs_, ret_, err_)                                \
     do {                                                                         \
         const syscall_regs_t *const __regs = (regs_);                           \
@@ -737,6 +761,10 @@ static uint32_t timeout_ms_to_ticks(int32_t timeout_ms) {
         abi_write32_at(__abi_base, SYSCALL_ABI_OFF_ERRNO, (err_));              \
         abi_write32_at(__abi_base, SYSCALL_ABI_OFF_TICK, sched_ticks());        \
     } while (0)
+
+#ifndef LAMP_SYSCALL_TRACE
+#define LAMP_SYSCALL_TRACE 0
+#endif
 
 void syscall_init(void) {
     g_realtime_offset_neg = 0u;
@@ -763,6 +791,13 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
         return (uint32_t)-1;
     }
 
+#if LAMP_SYSCALL_TRACE
+    klog_begin(KLOG_LEVEL_INFO, "sc");
+    klog_puts("nr="); klog_hex32(regs->nr);
+    klog_puts(" a0="); klog_hex32(regs->arg0);
+    klog_end();
+#endif
+
     switch (regs->nr) {
         case SYS_GETPID:
             ret = (uint32_t)sched_current_tid();
@@ -778,11 +813,16 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             sched_sleep_ticks(regs->arg0);
             ret = 0u;
             break;
-        case SYS_EXIT:
+        case SYS_EXIT: {
+#if LAMP_SYSCALL_TRACE
+            klog_begin(KLOG_LEVEL_WARN, "exit");
+            klog_puts("tid="); klog_hex32((uint32_t)sched_current_tid());
+            klog_puts(" code="); klog_hex32(regs->arg0);
+            klog_end();
+#endif
             sched_exit_code(regs->arg0);
-            for (;;) {
-                __asm__ volatile("pause\n" ::: "memory");
-            }
+            __builtin_unreachable();
+        }
         case SYS_WAITPID: {
             int32_t pid = (int32_t)regs->arg0;
             uint32_t status_addr = regs->arg1;
@@ -909,6 +949,15 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             uint32_t nonblock = fd_is_nonblock(fd) | ((flags & SYS_IO_NONBLOCK) ? 1u : 0u);
             uint32_t t = fd_type(fd);
             uint32_t i;
+
+            if (LAMP_SYSCALL_TRACE && fd == 0) {
+                klog_begin(KLOG_LEVEL_INFO, "read");
+                klog_puts("fd=0 type="); klog_hex32(t);
+                klog_puts(" can_read="); klog_hex32(fd_supports_read(fd));
+                klog_puts(" nonblock="); klog_hex32(nonblock);
+                klog_puts(" len="); klog_hex32(len);
+                klog_end();
+            }
 
             if (!fd_supports_read(fd)) {
                 err = ERRNO_EBADF;
@@ -1048,7 +1097,7 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                         ret = (uint32_t)-1;
                         break;
                     }
-                    sched_block_until_runnable();
+                    (void)syscall_console_wait_ready_spin(-1, 0u, 0u);
                     continue;
                 }
                 if (n == 0) {
@@ -1707,6 +1756,9 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             uint32_t path_addr = regs->arg0;
             uint32_t argv_addr = regs->arg1;
             uint32_t envp_addr = regs->arg2;
+            /* block external IRQs: execve does deep call chains (ELF load, disk I/O)
+               that cannot tolerate nested IRQs on the shared call stack */
+            __asm__ volatile("out %0, %1" :: "r"(1u), "r"(IO_CPU_CTX_IRQ_MASK));
             char path[FS_PATH_CAP];
             char argv_storage[SYSCALL_EXEC_MAX_ARGV][FS_PATH_CAP];
             char envp_storage[SYSCALL_EXEC_MAX_ENVP][FS_PATH_CAP];
@@ -1743,10 +1795,13 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             break;
         }
         case SYS_VFORK: {
-            int rc = sched_vfork(regs->abi_addr);
+            int rc;
+            __asm__ volatile("out %0, %1" :: "r"(1u), "r"(IO_CPU_CTX_IRQ_MASK));
+            rc = sched_vfork(regs->abi_addr);
             if (rc < 0) {
                 err = ERRNO_EAGAIN;
                 ret = (uint32_t)-1;
+                __asm__ volatile("out %0, %1" :: "r"(0u), "r"(IO_CPU_CTX_IRQ_MASK));
                 break;
             }
             ret = (uint32_t)rc;
@@ -1894,9 +1949,9 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 }
 
                 if (wait_read_stdin) {
-                    uint32_t wait_ticks = (timeout_ms > 0) ? remaining_ticks : 0u;
-                    if (console_wait_readable(wait_ticks, 0u) == CONSOLE_IO_BLOCKED) {
-                        sched_block_until_runnable();
+                    if (!syscall_console_wait_ready_spin(timeout_ms, start_tick, timeout_ticks)) {
+                        ret = 0u;
+                        break;
                     }
                     continue;
                 }
@@ -2026,9 +2081,9 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 }
 
                 if (wait_read_stdin) {
-                    uint32_t wait_ticks = (timeout_ms > 0) ? remaining_ticks : 0u;
-                    if (console_wait_readable(wait_ticks, 0u) == CONSOLE_IO_BLOCKED) {
-                        sched_block_until_runnable();
+                    if (!syscall_console_wait_ready_spin(timeout_ms, start_tick, timeout_ticks)) {
+                        ret = 0u;
+                        break;
                     }
                     continue;
                 }

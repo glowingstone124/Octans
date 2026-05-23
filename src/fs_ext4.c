@@ -1,6 +1,8 @@
 #include "../include/kernel/blk.h"
 #include "../include/kernel/fs.h"
 #include "../include/kernel/fs_ext4.h"
+#include "../include/kernel/mmu.h"
+#include "../include/kernel/platform.h"
 #include "../include/kernel/printk.h"
 #include "../include/kernel/sched.h"
 #include "../include/kernel/spinlock.h"
@@ -1318,6 +1320,31 @@ static int ext4_try_probe_locked(void) {
     klog_puts(" groups=");
     klog_hex32(g_ext4.group_count);
     klog_end();
+
+    /* memory layout diagnostic — verify no overlap between BSS, stack pool */
+    {
+        extern uint8_t __bss_start[], __bss_end[];
+        extern uint8_t __text_start[], __data_end[];
+
+        klog_begin(KLOG_LEVEL_INFO, "mem");
+        klog_puts("text=");     klog_hex32((uint32_t)(uintptr_t)__text_start);
+        klog_puts(" data_end="); klog_hex32((uint32_t)(uintptr_t)__data_end);
+        klog_puts(" bss_start="); klog_hex32((uint32_t)(uintptr_t)__bss_start);
+        klog_puts(" bss_end=");  klog_hex32((uint32_t)(uintptr_t)__bss_end);
+        klog_end();
+        klog_begin(KLOG_LEVEL_INFO, "mem");
+        klog_puts("bcache=");    klog_hex32((uint32_t)(uintptr_t)&g_block_cache[0]);
+        klog_puts(" bcache_end="); klog_hex32((uint32_t)(uintptr_t)&g_block_cache[EXT4_BLOCK_CACHE_SLOTS]);
+        klog_puts(" io_block="); klog_hex32((uint32_t)(uintptr_t)&g_io_block[0]);
+        klog_end();
+        klog_begin(KLOG_LEVEL_INFO, "mem");
+        klog_puts("stack_pool="); klog_hex32(VM_STACK_POOL_BASE);
+        klog_puts(" slot=");     klog_hex32(VM_STACK_SLOT_BYTES);
+        klog_puts(" slots=");    klog_hex32(VM_STACK_POOL_SLOTS);
+        klog_puts(" pool_end="); klog_hex32(KERNEL_MEM_SIZE);
+        klog_end();
+    }
+
     return 0;
 }
 

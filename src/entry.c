@@ -25,6 +25,22 @@ static void kernel_late_init(void) {
 }
 
 void kernel_entry(void) {
+    /*
+     * BIOS ran before us and left return addresses on the hardware
+     * call stack.  Reset CSP to empty so no future ret can land in
+     * BIOS code.  DSP and ISP are similarly reset for hygiene.
+     */
+    __asm__ volatile(
+        "movi r0, 1024\n"
+        "movi r1, 0xF0\n"
+        "out r0, r1\n"
+        "movi r0, 1024\n"
+        "movi r1, 0xF1\n"
+        "out r0, r1\n"
+        "movi r0, 1024\n"
+        "movi r1, 0xF3\n"
+        "out r0, r1\n"
+        ::: "r0", "r1", "memory");
     kernel_early_init();
     console_fb_init();
     console_init();

@@ -27,6 +27,7 @@ volatile uint32_t g_irq_stub_saved_fp[32];
 volatile uint32_t g_irq_frame_from_user[32u * VM_ISR_STACK_ENTRIES];
 volatile uint32_t g_irq_frame_saved_sp[32u * VM_ISR_STACK_ENTRIES];
 volatile uint32_t g_irq_frame_saved_fp[32u * VM_ISR_STACK_ENTRIES];
+volatile uint32_t g_irq_frame_irq_masked[32u * VM_ISR_STACK_ENTRIES];
 volatile uint32_t g_irq_saved_user_csp[32];
 volatile uint32_t g_irq_saved_user_dsp[32];
 volatile uint32_t g_irq_saved_user_call_base[32];
@@ -272,6 +273,9 @@ void irq_common_entry(uint32_t irq_no) {
 }
 
 void irq_common_entry_from_stub(void) {
+    if (g_irq_stub_from_user[irq_stub_cpu_index()] != 0u) {
+        sched_save_current_user_irq_ctx();
+    }
     irq_common_entry(g_irq_stub_no[irq_stub_cpu_index()]);
 }
 
@@ -518,6 +522,14 @@ __asm__(
     "  movi r0, g_irq_frame_from_user\n"
     "  add r0, r0, r19\n"
     "  store32 r20, r0, 0\n"
+    "  movi r1, " STR(IO_CPU_CTX_IRQ_MASK) "\n"
+    "  in r0, r1\n"
+    "  movi r1, g_irq_frame_irq_masked\n"
+    "  add r1, r1, r19\n"
+    "  store32 r0, r1, 0\n"
+    "  movi r0, 1\n"
+    "  movi r1, " STR(IO_CPU_CTX_IRQ_MASK) "\n"
+    "  out r0, r1\n"
     "  movi r0, g_irq_frame_saved_sp\n"
     "  add r0, r0, r19\n"
     "  store32 r30, r0, 0\n"
@@ -597,6 +609,11 @@ __asm__(
     "  load32 r3, r0, 0\n"
     "  movi r1, " STR(IO_CPU_CTX_DSP) "\n"
     "  out r3, r1\n"
+    "  movi r0, g_irq_frame_irq_masked\n"
+    "  add r0, r0, r19\n"
+    "  load32 r1, r0, 0\n"
+    "  movi r0, " STR(IO_CPU_CTX_IRQ_MASK) "\n"
+    "  out r1, r0\n"
     ".Lirq_skip_user_ctx_restore:\n"
     "  iret\n"
 );

@@ -15,7 +15,7 @@ typedef struct sched_sigaction32 {
 } sched_sigaction32_t;
 
 enum {
-    SCHED_MAX_TASKS = 16u,
+    SCHED_MAX_TASKS = 64u,
     SCHED_NAME_MAX = 16u,
     SCHED_MAX_FDS = 32u,
     SCHED_CWD_CAP = 64u
@@ -193,6 +193,7 @@ void sched_waitq_wake_one(sched_waitq_t *q);
 void sched_waitq_wake_all(sched_waitq_t *q);
 void sched_block_until_runnable(void);
 void sched_pump_once(void);
+void sched_save_current_user_irq_ctx(void);
 
 void sched_run(void);
 void schedule_tick(void);

@@ -637,10 +637,8 @@ static void user_exec_task_entry(sched_task_t *task, void *arg) {
     }
     envp[i] = 0;
 
-    user_exec_cpu_ctx_write32(IO_CPU_CTX_IN_INTERRUPT, 0u);
     irq_disable(IRQ_TIMER);
     rc = user_exec_load_elf_from_ext4(&ctx->path[0], argv, envp, &img);
-    user_exec_cpu_ctx_write32(IO_CPU_CTX_IN_INTERRUPT, 1u);
     if (rc != 0) {
         irq_enable(IRQ_TIMER);
         klog_begin(KLOG_LEVEL_ERROR, "user_exec");
@@ -659,7 +657,6 @@ static void user_exec_task_entry(sched_task_t *task, void *arg) {
     user_exec_release_ctx(ctx);
     irq_enable(IRQ_TIMER);
     user_exec_cpu_ctx_write32(IO_CPU_CTX_IRQ_MASK, 1u);
-    user_exec_cpu_ctx_write32(IO_CPU_CTX_IN_INTERRUPT, 0u);
     user_exec_enter_via_irq(img.entry, img.stack_ptr);
 }
 
@@ -744,15 +741,8 @@ int user_exec_execve_current(const char *path, const char *const argv[], const c
         return FS_ERR_INVAL;
     }
 
-    /*
-     * The syscall runs with in_interrupt=1 which blocks IRQ delivery.
-     * ELF loading does disk I/O that may need the disk completion IRQ.
-     * Temporarily drop in_interrupt so vm_handle_interrupts can fire.
-     */
-    user_exec_cpu_ctx_write32(IO_CPU_CTX_IN_INTERRUPT, 0u);
     irq_disable(IRQ_TIMER);
     int rc = user_exec_load_elf_from_ext4(path, argv, envp, &img);
-    user_exec_cpu_ctx_write32(IO_CPU_CTX_IN_INTERRUPT, 1u);
     if (rc != 0) {
         irq_enable(IRQ_TIMER);
         return rc;
@@ -761,13 +751,6 @@ int user_exec_execve_current(const char *path, const char *const argv[], const c
         irq_enable(IRQ_TIMER);
         return FS_ERR_INVAL;
     }
-
-    /* beacon: ELF loaded, about to transition to new process */
-    __asm__ volatile("out %0, %1" :: "r"('E'), "r"(IO_SERIAL_TX));
-    __asm__ volatile("out %0, %1" :: "r"('X'), "r"(IO_SERIAL_TX));
-    __asm__ volatile("out %0, %1" :: "r"('E'), "r"(IO_SERIAL_TX));
-    __asm__ volatile("out %0, %1" :: "r"('C'), "r"(IO_SERIAL_TX));
-    __asm__ volatile("out %0, %1" :: "r"('\n'), "r"(IO_SERIAL_TX));
 
     sched_task_set_kind(SCHED_TASK_KIND_USER);
     sched_task_set_exec_state(SCHED_EXEC_STATE_USER);
