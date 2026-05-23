@@ -14,10 +14,41 @@
 #define FG_DEFAULT 0x00FFFFFFu
 #define BG_DEFAULT 0x00000000u
 
+/* ANSI SGR state machine */
+enum {
+    ANSI_NORM = 0,
+    ANSI_ESC  = 1,
+    ANSI_CSI  = 2
+};
+
+/* 16 standard ANSI colors → 32-bit ARGB */
+static const uint32_t g_ansi_palette[16] = {
+    0xFF000000u, /* 0: Black        */
+    0xFFAA0000u, /* 1: Red          */
+    0xFF00AA00u, /* 2: Green        */
+    0xFFAA5500u, /* 3: Yellow/Brown */
+    0xFF0000AAu, /* 4: Blue         */
+    0xFFAA00AAu, /* 5: Magenta      */
+    0xFF00AAAAu, /* 6: Cyan         */
+    0xFFAAAAAAu, /* 7: Light Gray   */
+    0xFF555555u, /* 8: Dark Gray    */
+    0xFFFF5555u, /* 9: Bright Red   */
+    0xFF55FF55u, /*10: Bright Green */
+    0xFFFFFF55u, /*11: Bright Yellow*/
+    0xFF5555FFu, /*12: Bright Blue  */
+    0xFFFF55FFu, /*13: Bright Magenta*/
+    0xFF55FFFFu, /*14: Bright Cyan  */
+    0xFFFFFFFFu, /*15: White        */
+};
+
 static int g_cursor_x;
 static int g_cursor_y;
 static uint32_t g_fg = FG_DEFAULT;
 static uint32_t g_bg = BG_DEFAULT;
+static int g_ansi_state = ANSI_NORM;
+static int g_ansi_bold;
+static uint32_t g_ansi_accum[8];
+static uint32_t g_ansi_naccum;
 static volatile uint32_t *const g_fb = (volatile uint32_t *)(uintptr_t)FB_BASE;
 
 /*
@@ -99,7 +130,52 @@ void console_fb_clear(void) {
     g_cursor_y = 0;
 }
 
+static void ansi_sgr_apply(uint32_t code) {
+    /* bright palette offset for bold colors */
+    uint32_t off = g_ansi_bold ? 8u : 0u;
+    if (code == 0u) {
+        g_fg = FG_DEFAULT; g_bg = BG_DEFAULT; g_ansi_bold = 0;
+    } else if (code == 1u) {
+        g_ansi_bold = 1;
+    } else if (code >= 30u && code <= 37u) {
+        g_fg = g_ansi_palette[(code - 30u) + off];
+    } else if (code >= 40u && code <= 47u) {
+        g_bg = g_ansi_palette[(code - 40u) + off];
+    }
+}
+
 void console_fb_putc(uint32_t c) {
+    /* ---- ANSI SGR escape sequence parser ---- */
+    if (g_ansi_state == ANSI_ESC) {
+        if (c == '[') {
+            g_ansi_state = ANSI_CSI;
+            g_ansi_naccum = 0u;
+            g_ansi_accum[0] = 0u;
+            return;
+        }
+        g_ansi_state = ANSI_NORM; return;
+    }
+    if (g_ansi_state == ANSI_CSI) {
+        if (c >= '0' && c <= '9') {
+            g_ansi_accum[g_ansi_naccum] = g_ansi_accum[g_ansi_naccum] * 10u + (c - '0');
+            return;
+        }
+        if (c == ';') {
+            if (g_ansi_naccum + 1u < 7u) {
+                g_ansi_naccum++;
+                g_ansi_accum[g_ansi_naccum] = 0u;
+            }
+            return;
+        }
+        if (c == 'm') {
+            for (uint32_t i = 0u; i <= g_ansi_naccum; i++) {
+                ansi_sgr_apply(g_ansi_accum[i]);
+            }
+        }
+        g_ansi_state = ANSI_NORM; return;
+    }
+    if (c == '\033') { g_ansi_state = ANSI_ESC; return; }
+    /* ---- end ANSI parser ---- */
     if (c == (uint32_t)'\a') {
         return;
     }
