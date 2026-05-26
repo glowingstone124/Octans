@@ -50,6 +50,7 @@ int fs_stat(const char *path, fs_stat_t *st);
 int fs_fstat(int32_t fd, fs_stat_t *st);
 int fs_getdents(int32_t fd, fs_dirent_t *dst, uint32_t len);
 int fs_readlink(const char *path, uint8_t *dst, uint32_t len);
+int fs_unlink(const char *path);
 int fs_read(int32_t fd, uint8_t *dst, uint32_t len);
 int fs_write(int32_t fd, const uint8_t *src, uint32_t len);
 

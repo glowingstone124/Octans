@@ -17,6 +17,7 @@ void irq_serial(uint32_t irq_no);
 void irq_serial_drain_rx(void);
 void irq_keyboard(uint32_t irq_no);
 void irq_mouse(uint32_t irq_no);
+void irq_ether(uint32_t irq_no);
 void irq_timer(uint32_t irq_no);
 void irq_syscall(uint32_t irq_no);
 

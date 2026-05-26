@@ -191,6 +191,16 @@ int fs_readlink(const char *path, uint8_t *dst, uint32_t len) {
     return fs_ext4_readlink(path, dst, len);
 }
 
+int fs_unlink(const char *path) {
+    if (!path || path[0] == '\0') {
+        return FS_ERR_INVAL;
+    }
+    if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/') {
+        return FS_ERR_ROFS;
+    }
+    return fs_ext4_unlink(path);
+}
+
 int fs_read(int32_t fd, uint8_t *dst, uint32_t len) {
     uint32_t t = SCHED_FD_TYPE_NONE;
     if (!dst || len == 0u) {

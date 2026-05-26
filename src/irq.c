@@ -3,6 +3,7 @@
 #include "../include/kernel/irq.h"
 #include "../include/kernel/panic.h"
 #include "../include/kernel/platform.h"
+#include "net/net.h"
 #include "../include/kernel/printk.h"
 #include "../include/kernel/sched.h"
 #include "../include/kernel/syscall.h"
@@ -262,6 +263,9 @@ void irq_common_entry(uint32_t irq_no) {
         case IRQ_MOUSE:
             irq_mouse(irq_no);
             break;
+        case IRQ_ETHER:
+            irq_ether(irq_no);
+            break;
         case IRQ_DIVIDE_BY_ZERO:
             irq_divide_by_zero(irq_no);
             break;
@@ -400,6 +404,11 @@ void irq_mouse(uint32_t irq_no) {
         g_irq_counts[irq_no]++;
     }
     ps2_mouse_drain_rx();
+}
+
+void irq_ether(uint32_t irq_no) {
+    if (irq_no < KERNEL_IVT_SIZE) g_irq_counts[irq_no]++;
+    ether_irq_handler();
 }
 
 void irq_timer(uint32_t irq_no) {

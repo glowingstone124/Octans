@@ -36,6 +36,7 @@ typedef struct sched_ofile {
     uint32_t file_size;
     uint32_t file_offset;
     uint32_t file_is_dir;
+    uint32_t sock_ptr; /* net_sock_t * for socket fds */
 } sched_ofile_t;
 
 typedef struct sched_fdent {
@@ -169,6 +170,9 @@ static inline uint32_t waitq_test_bit(const sched_waitq_t *q, uint32_t idx) {
 void sched_fd_table_clear(sched_task_slot_t *slot);
 void sched_fd_table_init_stdio(sched_task_slot_t *slot);
 int sched_fd_table_clone(sched_task_slot_t *dst, const sched_task_slot_t *src);
+int sched_fd_sock_get(int32_t fd, uint32_t *sock_ptr);
+void sched_fd_sock_set(int32_t fd, uint32_t sock_ptr);
+int sched_fd_sock_refs(int32_t fd, uint32_t *refs);
 int sched_slot_close_fd(sched_task_slot_t *slot, int32_t fd);
 void sched_slot_close_all_fds(sched_task_slot_t *slot);
 

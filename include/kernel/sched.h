@@ -135,6 +135,9 @@ struct sched_waitq {
 
 void sched_init(void);
 int sched_spawn(const char *name, sched_task_entry_t entry, void *arg);
+int sched_fd_sock_get(int32_t fd, uint32_t *sock_ptr);
+void sched_fd_sock_set(int32_t fd, uint32_t sock_ptr);
+int sched_fd_sock_refs(int32_t fd, uint32_t *refs);
 void sched_exit(void);
 void sched_exit_code(uint32_t code);
 void sched_yield(void);

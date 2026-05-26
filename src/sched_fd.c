@@ -397,6 +397,7 @@ int sched_fd_fcntl_getfl(int32_t fd, uint32_t *out_flags) {
     return SCHED_FD_OK;
 }
 
+
 int sched_fd_fcntl_getfd(int32_t fd, uint32_t *out_flags) {
     sched_fdent_t *fdent = 0;
     sched_task_slot_t *slot;
@@ -416,6 +417,7 @@ int sched_fd_fcntl_getfd(int32_t fd, uint32_t *out_flags) {
     return SCHED_FD_OK;
 }
 
+
 int sched_fd_fcntl_setfd(int32_t fd, uint32_t flags) {
     sched_fdent_t *fdent = 0;
     sched_task_slot_t *slot = sched_current_slot_fd_locked();
@@ -430,6 +432,7 @@ int sched_fd_fcntl_setfd(int32_t fd, uint32_t flags) {
     spinlock_unlock(&slot->fd_lock);
     return SCHED_FD_OK;
 }
+
 
 int sched_fd_fcntl_setfl(int32_t fd, uint32_t flags) {
     sched_ofile_t *of;
@@ -446,6 +449,7 @@ int sched_fd_fcntl_setfl(int32_t fd, uint32_t flags) {
     spinlock_unlock(&slot->fd_lock);
     return SCHED_FD_OK;
 }
+
 
 uint32_t sched_fd_can_read(int32_t fd) {
     uint32_t can_read = 0u;
@@ -725,6 +729,7 @@ int sched_fd_pipe(uint32_t pipefd_addr) {
     return SCHED_FD_OK;
 }
 
+
 int sched_fd_close_cloexec(void) {
     int closed = 0;
     sched_task_slot_t *slot = sched_current_slot_fd_locked();
@@ -766,6 +771,7 @@ int sched_fd_get_type(int32_t fd, uint32_t *out_type) {
     return SCHED_FD_OK;
 }
 
+
 int sched_fd_regular_get(int32_t fd, uint32_t *fs_backend, uint32_t *file_id, uint32_t *file_size,
                          uint32_t *file_offset, uint32_t *is_dir) {
     sched_ofile_t *of;
@@ -796,6 +802,7 @@ int sched_fd_regular_get(int32_t fd, uint32_t *fs_backend, uint32_t *file_id, ui
     spinlock_unlock(&slot->fd_lock);
     return SCHED_FD_OK;
 }
+
 
 int sched_fd_lseek(int32_t fd, int32_t offset, uint32_t whence, uint32_t *new_offset) {
     uint32_t base = 0u;
@@ -854,6 +861,7 @@ int sched_fd_lseek(int32_t fd, int32_t offset, uint32_t whence, uint32_t *new_of
     return SCHED_FD_OK;
 }
 
+
 static int sched_fd_pipe_id_for_fd(int32_t fd, uint32_t want_type, uint32_t *pipe_id_out) {
     sched_ofile_t *of;
     sched_task_slot_t *slot = sched_current_slot_fd_locked();
@@ -871,6 +879,7 @@ static int sched_fd_pipe_id_for_fd(int32_t fd, uint32_t want_type, uint32_t *pip
     spinlock_unlock(&slot->fd_lock);
     return SCHED_FD_OK;
 }
+
 
 int sched_fd_pipe_read(int32_t fd, uint8_t *dst, uint32_t len) {
     uint32_t pipe_id = 0u;
@@ -1001,6 +1010,7 @@ int sched_fd_regular_advance(int32_t fd, uint32_t delta, uint32_t *new_offset) {
     return SCHED_FD_OK;
 }
 
+
 int sched_fd_regular_commit_write(int32_t fd, uint32_t written, uint32_t new_size, uint32_t *new_offset) {
     uint32_t cur;
     uint32_t next;
@@ -1031,4 +1041,38 @@ int sched_fd_regular_commit_write(int32_t fd, uint32_t written, uint32_t new_siz
     }
     spinlock_unlock(&slot->fd_lock);
     return SCHED_FD_OK;
+}
+
+
+int sched_fd_sock_get(int32_t fd, uint32_t *sock_ptr) {
+    sched_ofile_t *of;
+    sched_task_slot_t *slot = sched_current_slot_fd_locked();
+    if (!slot) return -1;
+    of = sched_slot_ofile_by_fd(slot, fd, 0);
+    if (!of || of->type != SCHED_OFILE_TYPE_SOCKET) { spinlock_unlock(&slot->fd_lock); return -1; }
+    *sock_ptr = of->sock_ptr;
+    spinlock_unlock(&slot->fd_lock);
+    return 0;
+}
+void sched_fd_sock_set(int32_t fd, uint32_t sock_ptr) {
+    sched_ofile_t *of;
+    sched_task_slot_t *slot = sched_current_slot_fd_locked();
+    if (!slot) return;
+    of = sched_slot_ofile_by_fd(slot, fd, 0);
+    if (of && of->type == SCHED_OFILE_TYPE_SOCKET) of->sock_ptr = sock_ptr;
+    spinlock_unlock(&slot->fd_lock);
+}
+
+int sched_fd_sock_refs(int32_t fd, uint32_t *refs) {
+    sched_ofile_t *of;
+    sched_task_slot_t *slot = sched_current_slot_fd_locked();
+    if (!slot || !refs) return -1;
+    of = sched_slot_ofile_by_fd(slot, fd, 0);
+    if (!of || of->type != SCHED_OFILE_TYPE_SOCKET) {
+        spinlock_unlock(&slot->fd_lock);
+        return -1;
+    }
+    *refs = of->refs;
+    spinlock_unlock(&slot->fd_lock);
+    return 0;
 }

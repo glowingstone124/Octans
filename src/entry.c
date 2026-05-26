@@ -14,6 +14,7 @@
 #include "../include/kernel/types.h"
 #include "../include/kernel/vm_info.h"
 #include "../include/kernel/panic.h"
+#include "net/net.h"
 static volatile uint32_t g_kernel_booted;
 
 static void kernel_early_init(void) {
@@ -51,6 +52,7 @@ void kernel_entry(void) {
     trap_init();
     irq_input_init();
     syscall_init();
+    ether_init();
     KLOGI("trap", "ready, input irq enabled");
     KLOGI("syscall", "irq 0x80 dispatch ready");
 

@@ -15,10 +15,11 @@ fi
 
 mkdir -p build-kernel
 
-for f in kernel/src/*.c; do
+for f in kernel/src/*.c kernel/src/net/*.c; do
   "$LAMP_CLANG" --target=lamp-unknown-unknown \
     -ffreestanding -fno-builtin -fno-stack-protector -fomit-frame-pointer \
     -fno-optimize-sibling-calls -O0 \
+    ${LAMP_KERNEL_CFLAGS:-} \
     -Ikernel/include -c "$f" \
     -o "build-kernel/$(basename "$f" .c).o"
 done

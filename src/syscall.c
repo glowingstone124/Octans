@@ -7,6 +7,7 @@
 #include "../include/kernel/sched.h"
 #include "../include/kernel/syscall.h"
 #include "../include/kernel/user_exec.h"
+#include "net/net.h"
 
 /*
  * Current VM interrupt model restores caller registers on IRET.
@@ -477,6 +478,9 @@ static inline uint32_t fd_read_ready(int32_t fd) {
     if (t == SCHED_FD_TYPE_PIPE_READ) {
         return sched_fd_pipe_read_ready(fd);
     }
+    if (t == SCHED_FD_TYPE_SOCKET) {
+        return 1u;
+    }
     return 0u;
 }
 
@@ -486,7 +490,7 @@ static inline uint32_t fd_write_ready(int32_t fd) {
         return 0u;
     }
     if (t == SCHED_FD_TYPE_SOCKET) {
-        return 0u;
+        return 1u;
     }
     if (t == SCHED_FD_TYPE_PIPE_WRITE) {
         return sched_fd_pipe_write_ready(fd);
@@ -998,6 +1002,62 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 break;
             }
             if (t == SCHED_FD_TYPE_SOCKET) {
+                uint32_t sock_ptr = 0;
+                sched_fd_sock_get(fd, &sock_ptr);
+                if (sock_ptr) {
+                    net_sock_t *ns = (net_sock_t *)(uintptr_t)sock_ptr;
+                    if (ns->sock_type == 1) { /* TCP */
+                        int nr = 0;
+                        uint32_t socket_want = len;
+                        if (socket_want > (uint32_t)sizeof(byte_buf)) {
+                            socket_want = (uint32_t)sizeof(byte_buf);
+                        }
+                        for (;;) {
+                            nr = net_recv(ns, byte_buf, socket_want);
+                            if (nr > 0) {
+#if LAMP_SYSCALL_TRACE
+                                klog_begin(KLOG_LEVEL_INFO, "read_sock_ret");
+                                klog_puts("fd="); klog_hex32((uint32_t)fd);
+                                klog_puts(" buf="); klog_hex32(buf_addr);
+                                klog_puts(" len="); klog_hex32(len);
+                                klog_puts(" nr="); klog_hex32((uint32_t)nr);
+                                klog_end();
+#endif
+                                if (!abi_user_write_bytes(buf_addr, byte_buf, (uint32_t)nr)) {
+                                    err = ERRNO_EFAULT;
+                                    ret = (uint32_t)-1;
+                                } else {
+                                    ret = (uint32_t)nr;
+                                }
+                                break;
+                            }
+                            if (ns->tcp.state != TCP_ESTABLISHED) {
+                                ret = 0u;
+                                break;
+                            }
+#if LAMP_SYSCALL_TRACE
+                            {
+                                static uint32_t socket_read_wait_log_budget = 12u;
+                                if (socket_read_wait_log_budget != 0u) {
+                                    klog_begin(KLOG_LEVEL_INFO, "read_sock");
+                                    klog_puts("fd="); klog_hex32((uint32_t)fd);
+                                    klog_puts(" state="); klog_hex32(ns->tcp.state);
+                                    klog_puts(" rx_len="); klog_hex32(ns->tcp.rx_len);
+                                    klog_end();
+                                    socket_read_wait_log_budget--;
+                                }
+                            }
+#endif
+                            if (nonblock) {
+                                err = ERRNO_EAGAIN;
+                                ret = (uint32_t)-1;
+                                break;
+                            }
+                            for (volatile int __net_read_wait = 0; __net_read_wait < 20000; __net_read_wait++) {}
+                        }
+                        break;
+                    }
+                }
                 err = ERRNO_ENOTCONN;
                 ret = (uint32_t)-1;
                 break;
@@ -1152,6 +1212,18 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 break;
             }
             if (t == SCHED_FD_TYPE_SOCKET) {
+                uint32_t sock_ptr = 0;
+                sched_fd_sock_get(fd, &sock_ptr);
+                if (sock_ptr) {
+                    net_sock_t *ns = (net_sock_t *)(uintptr_t)sock_ptr;
+                    if (ns->sock_type == 1) { /* TCP */
+                        abi_user_read_bytes(buf_addr, byte_buf, len);
+                        int nsent = net_send(ns, byte_buf, len);
+                        if (nsent >= 0) { ret = (uint32_t)nsent; }
+                        else { err = ERRNO_ENOTCONN; ret = (uint32_t)-1; }
+                        break;
+                    }
+                }
                 err = ERRNO_ENOTCONN;
                 ret = (uint32_t)-1;
                 break;
@@ -1250,6 +1322,20 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             break;
         }
         case SYS_CLOSE: {
+            /* Free socket state only when this fd owns the last reference. */
+            {
+                int32_t cfd = (int32_t)regs->arg0;
+                if (fd_type(cfd) == SCHED_FD_TYPE_SOCKET) {
+                    uint32_t sp = 0;
+                    uint32_t refs = 0;
+                    sched_fd_sock_get(cfd, &sp);
+                    sched_fd_sock_refs(cfd, &refs);
+                    if (sp && refs <= 1u) {
+                        net_close((net_sock_t *)(uintptr_t)sp);
+                        sched_fd_sock_set(cfd, 0);
+                    }
+                }
+            }
             int rc = sched_fd_close((int32_t)regs->arg0);
             if (rc != SCHED_FD_OK) {
                 err = errno_from_sched_fd_rc(rc);
@@ -1352,7 +1438,8 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             int rc;
             char path[FS_PATH_CAP];
 
-            if ((flags & ~(SYS_O_ACCMODE | SYS_O_NONBLOCK | SYS_O_CREAT | SYS_O_TRUNC)) != 0u) {
+            if ((flags & ~(SYS_O_ACCMODE | SYS_O_NONBLOCK | SYS_O_CREAT | SYS_O_TRUNC |
+                           SYS_O_EXCL | SYS_O_NOCTTY | SYS_O_APPEND | SYS_O_CLOEXEC)) != 0u) {
                 err = ERRNO_EINVAL;
                 ret = (uint32_t)-1;
                 break;
@@ -1591,6 +1678,24 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             ret = buf_addr;
             break;
         }
+        case SYS_UNLINK: {
+            uint32_t path_addr = regs->arg0;
+            char path[FS_PATH_CAP];
+            int rc;
+
+            if (!syscall_read_resolved_path(path_addr, path, &err)) {
+                ret = (uint32_t)-1;
+                break;
+            }
+            rc = fs_unlink(path);
+            if (rc != 0) {
+                err = errno_from_fs_rc(rc);
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = 0u;
+            break;
+        }
         case SYS_SOCKET: {
             uint32_t domain = regs->arg0;
             uint32_t type = regs->arg1;
@@ -1598,7 +1703,6 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             uint32_t sock_kind = type & 0x0Fu;
             int rc;
 
-            (void)regs->arg2; /* protocol: currently ignored in kernel stub */
             if (!(domain == SOCK_AF_UNIX || domain == SOCK_AF_INET || domain == SOCK_AF_INET6)) {
                 err = ERRNO_EAFNOSUPPORT;
                 ret = (uint32_t)-1;
@@ -1617,6 +1721,18 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 err = errno_from_sched_fd_rc(rc);
                 ret = (uint32_t)-1;
                 break;
+            }
+            /* allocate kernel socket state */
+            {
+                net_sock_t *ns = 0;
+                if (net_socket(domain, type, regs->arg2, &ns) == 0 && ns) {
+                    sched_fd_sock_set(rc, (uint32_t)(uintptr_t)ns);
+                } else {
+                    sched_fd_close(rc);
+                    err = ERRNO_EAFNOSUPPORT;
+                    ret = (uint32_t)-1;
+                    break;
+                }
             }
             ret = (uint32_t)rc;
             break;
@@ -1818,30 +1934,158 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             ret = new_offset;
             break;
         }
-        case SYS_CONNECT:
+        case SYS_CONNECT: {
+            int32_t fd = (int32_t)regs->arg0;
+            uint32_t addr_ptr = regs->arg1;
+            if (!fd_is_valid(fd) || fd_type(fd) != SCHED_FD_TYPE_SOCKET) {
+                err = ERRNO_EBADF; ret = (uint32_t)-1; break;
+            }
+            uint32_t sock_ptr = 0; sched_fd_sock_get(fd, &sock_ptr);
+            if (!sock_ptr) { err = ERRNO_ENOTCONN; ret = (uint32_t)-1; break; }
+            /* parse sockaddr_in at addr_ptr: family(2)+port(2)+ip(4) */
+            uint8_t sa[8];
+            if (!abi_user_read_bytes(addr_ptr, sa, 8)) { err = ERRNO_EFAULT; ret = (uint32_t)-1; break; }
+            uint32_t ip = ((uint32_t)sa[4]<<24)|((uint32_t)sa[5]<<16)|((uint32_t)sa[6]<<8)|sa[7];
+            uint16_t port = ((uint16_t)sa[2]<<8)|sa[3];
+            net_sock_t *ns = (net_sock_t *)(uintptr_t)sock_ptr;
+            if (net_connect(ns, ip, port) < 0) { err = ERRNO_ENOTCONN; ret = (uint32_t)-1; break; }
+            ret = 0; break;
+        }
         case SYS_BIND:
         case SYS_LISTEN:
-        case SYS_ACCEPT:
+        case SYS_ACCEPT: {
+            err = ERRNO_EOPNOTSUPP; ret = (uint32_t)-1; break;
+        }
         case SYS_SEND:
-        case SYS_RECV: {
+        {
             int32_t fd = (int32_t)regs->arg0;
-            if (!fd_is_valid(fd)) {
+            uint32_t buf_addr = regs->arg1;
+            uint32_t len = regs->arg2;
+            uint32_t dest_addr = regs->arg4;
+            uint32_t dest_len = regs->arg5;
+            uint32_t sock_ptr = 0u;
+            net_sock_t *ns;
+
+            (void)regs->arg3; /* flags: currently ignored */
+            if (!fd_is_valid(fd) || fd_type(fd) != SCHED_FD_TYPE_SOCKET) {
                 err = ERRNO_EBADF;
                 ret = (uint32_t)-1;
                 break;
             }
-            if (fd_type(fd) != SCHED_FD_TYPE_SOCKET) {
-                err = ERRNO_ENOTSOCK;
+            if (len != 0u && (buf_addr == 0u || !abi_ptr_range_ok(buf_addr, len))) {
+                err = ERRNO_EFAULT;
                 ret = (uint32_t)-1;
                 break;
             }
-
-            if (regs->nr == SYS_SEND || regs->nr == SYS_RECV) {
+            if (sched_fd_sock_get(fd, &sock_ptr) != 0 || sock_ptr == 0u) {
                 err = ERRNO_ENOTCONN;
-            } else {
-                err = ERRNO_EOPNOTSUPP;
+                ret = (uint32_t)-1;
+                break;
             }
+            ns = (net_sock_t *)(uintptr_t)sock_ptr;
+            if (ns->sock_type == SOCK_TYPE_TCP) {
+                int n = net_send(ns, (const uint8_t *)(uintptr_t)buf_addr, len);
+                if (n < 0) {
+                    err = ERRNO_ENOTCONN;
+                    ret = (uint32_t)-1;
+                    break;
+                }
+                ret = (uint32_t)n;
+                break;
+            }
+            if (ns->sock_type == SOCK_TYPE_UDP) {
+                uint8_t sa[8];
+                uint32_t ip;
+                uint16_t port;
+                int n;
+
+                if (dest_addr == 0u || dest_len < 8u ||
+                    !abi_user_read_bytes(dest_addr, sa, (uint32_t)sizeof(sa))) {
+                    err = ERRNO_EINVAL;
+                    ret = (uint32_t)-1;
+                    break;
+                }
+                ip = ((uint32_t)sa[4] << 24) | ((uint32_t)sa[5] << 16) |
+                     ((uint32_t)sa[6] << 8) | (uint32_t)sa[7];
+                port = ((uint16_t)sa[2] << 8) | sa[3];
+                n = net_udp_sendto(ns, ip, port, (const uint8_t *)(uintptr_t)buf_addr, len);
+                if (n < 0) {
+                    err = ERRNO_EIO;
+                    ret = (uint32_t)-1;
+                    break;
+                }
+                ret = (uint32_t)n;
+                break;
+            }
+            if (ns->sock_type == SOCK_TYPE_RAW) {
+                uint8_t sa[8];
+                uint32_t ip;
+                int n;
+
+                if (dest_addr == 0u || dest_len < 8u ||
+                    !abi_user_read_bytes(dest_addr, sa, (uint32_t)sizeof(sa))) {
+                    err = ERRNO_EINVAL;
+                    ret = (uint32_t)-1;
+                    break;
+                }
+                ip = ((uint32_t)sa[4] << 24) | ((uint32_t)sa[5] << 16) |
+                     ((uint32_t)sa[6] << 8) | (uint32_t)sa[7];
+                n = net_raw_sendto(ns, ip, (const uint8_t *)(uintptr_t)buf_addr, len);
+                if (n < 0) {
+                    err = ERRNO_EIO;
+                    ret = (uint32_t)-1;
+                    break;
+                }
+                ret = (uint32_t)n;
+                break;
+            }
+            err = ERRNO_ENOTCONN;
             ret = (uint32_t)-1;
+            break;
+        }
+        case SYS_RECV: {
+            int32_t fd = (int32_t)regs->arg0;
+            uint32_t buf_addr = regs->arg1;
+            uint32_t len = regs->arg2;
+            uint32_t sock_ptr = 0u;
+            net_sock_t *ns;
+            int n;
+
+            (void)regs->arg3; /* flags: currently ignored */
+            if (!fd_is_valid(fd) || fd_type(fd) != SCHED_FD_TYPE_SOCKET) {
+                err = ERRNO_EBADF;
+                ret = (uint32_t)-1;
+                break;
+            }
+            if (len != 0u && (buf_addr == 0u || !abi_ptr_range_ok(buf_addr, len))) {
+                err = ERRNO_EFAULT;
+                ret = (uint32_t)-1;
+                break;
+            }
+            if (sched_fd_sock_get(fd, &sock_ptr) != 0 || sock_ptr == 0u) {
+                err = ERRNO_ENOTCONN;
+                ret = (uint32_t)-1;
+                break;
+            }
+            ns = (net_sock_t *)(uintptr_t)sock_ptr;
+            if (ns->sock_type == SOCK_TYPE_TCP) {
+                n = net_recv(ns, (uint8_t *)(uintptr_t)buf_addr, len);
+            } else if (ns->sock_type == SOCK_TYPE_UDP) {
+                uint32_t from_ip = 0u;
+                uint16_t from_port = 0u;
+                n = net_udp_recvfrom(ns, (uint8_t *)(uintptr_t)buf_addr, len, &from_ip, &from_port);
+            } else if (ns->sock_type == SOCK_TYPE_RAW) {
+                uint32_t from_ip = 0u;
+                n = net_raw_recvfrom(ns, (uint8_t *)(uintptr_t)buf_addr, len, &from_ip);
+            } else {
+                n = -1;
+            }
+            if (n < 0) {
+                err = ERRNO_EAGAIN;
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = (uint32_t)n;
             break;
         }
         case SYS_POLL: {
