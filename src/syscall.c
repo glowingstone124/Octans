@@ -44,6 +44,7 @@ enum {
     ERRNO_ENOMEM = 12u,
     ERRNO_EFAULT = 14u,
     ERRNO_EBUSY = 16u,
+    ERRNO_EEXIST = 17u,
     ERRNO_ENOTDIR = 20u,
     ERRNO_EISDIR = 21u,
     ERRNO_EMFILE = 24u,
@@ -591,6 +592,9 @@ static uint32_t errno_from_fs_rc(int rc) {
     if (rc == FS_ERR_BUSY) {
         return ERRNO_EBUSY;
     }
+    if (rc == FS_ERR_EXIST) {
+        return ERRNO_EEXIST;
+    }
     if (rc == FS_ERR_NOSPC) {
         return ERRNO_ENOSPC;
     }
@@ -1006,7 +1010,7 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 sched_fd_sock_get(fd, &sock_ptr);
                 if (sock_ptr) {
                     net_sock_t *ns = (net_sock_t *)(uintptr_t)sock_ptr;
-                    if (ns->sock_type == 1) { /* TCP */
+                    if (ns->sock_type == SOCK_TYPE_TCP) {
                         int nr = 0;
                         uint32_t socket_want = len;
                         if (socket_want > (uint32_t)sizeof(byte_buf)) {
@@ -1055,6 +1059,26 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                             }
                             for (volatile int __net_read_wait = 0; __net_read_wait < 20000; __net_read_wait++) {}
                         }
+                        break;
+                    }
+                    if (ns->sock_type == SOCK_TYPE_UDP || ns->sock_type == SOCK_TYPE_RAW) {
+                        uint32_t socket_want = len;
+                        int nr;
+                        if (socket_want > (uint32_t)sizeof(byte_buf)) {
+                            socket_want = (uint32_t)sizeof(byte_buf);
+                        }
+                        nr = net_recv(ns, byte_buf, socket_want);
+                        if (nr < 0) {
+                            err = ERRNO_EAGAIN;
+                            ret = (uint32_t)-1;
+                            break;
+                        }
+                        if (!abi_user_write_bytes(buf_addr, byte_buf, (uint32_t)nr)) {
+                            err = ERRNO_EFAULT;
+                            ret = (uint32_t)-1;
+                            break;
+                        }
+                        ret = (uint32_t)nr;
                         break;
                     }
                 }
@@ -1216,9 +1240,41 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 sched_fd_sock_get(fd, &sock_ptr);
                 if (sock_ptr) {
                     net_sock_t *ns = (net_sock_t *)(uintptr_t)sock_ptr;
-                    if (ns->sock_type == 1) { /* TCP */
-                        abi_user_read_bytes(buf_addr, byte_buf, len);
-                        int nsent = net_send(ns, byte_buf, len);
+                    if (ns->sock_type == SOCK_TYPE_TCP) {
+                        while (total < len) {
+                            uint32_t remain = len - total;
+                            uint32_t want = (remain > (uint32_t)sizeof(byte_buf)) ? (uint32_t)sizeof(byte_buf) : remain;
+                            int nsent;
+                            if (!abi_user_read_bytes(buf_addr + total, byte_buf, want)) {
+                                err = ERRNO_EFAULT;
+                                ret = (uint32_t)-1;
+                                break;
+                            }
+                            nsent = net_send(ns, byte_buf, want);
+                            if (nsent < 0) {
+                                err = ERRNO_ENOTCONN;
+                                ret = (uint32_t)-1;
+                                break;
+                            }
+                            total += (uint32_t)nsent;
+                            if ((uint32_t)nsent != want) break;
+                        }
+                        if (err == ERRNO_OK) ret = total;
+                        break;
+                    }
+                    if (ns->sock_type == SOCK_TYPE_UDP) {
+                        int nsent;
+                        if (len > (uint32_t)sizeof(byte_buf)) {
+                            err = ERRNO_EINVAL;
+                            ret = (uint32_t)-1;
+                            break;
+                        }
+                        if (!abi_user_read_bytes(buf_addr, byte_buf, len)) {
+                            err = ERRNO_EFAULT;
+                            ret = (uint32_t)-1;
+                            break;
+                        }
+                        nsent = net_send(ns, byte_buf, len);
                         if (nsent >= 0) { ret = (uint32_t)nsent; }
                         else { err = ERRNO_ENOTCONN; ret = (uint32_t)-1; }
                         break;
@@ -1951,7 +2007,45 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
             if (net_connect(ns, ip, port) < 0) { err = ERRNO_ENOTCONN; ret = (uint32_t)-1; break; }
             ret = 0; break;
         }
-        case SYS_BIND:
+        case SYS_BIND: {
+            int32_t fd = (int32_t)regs->arg0;
+            uint32_t addr_ptr = regs->arg1;
+            uint32_t addr_len = regs->arg2;
+            uint32_t sock_ptr = 0u;
+            uint8_t sa[8];
+            uint16_t port;
+            net_sock_t *ns;
+
+            if (!fd_is_valid(fd) || fd_type(fd) != SCHED_FD_TYPE_SOCKET) {
+                err = ERRNO_EBADF;
+                ret = (uint32_t)-1;
+                break;
+            }
+            if (addr_ptr == 0u || addr_len < 8u || !abi_user_read_bytes(addr_ptr, sa, (uint32_t)sizeof(sa))) {
+                err = ERRNO_EFAULT;
+                ret = (uint32_t)-1;
+                break;
+            }
+            if (sched_fd_sock_get(fd, &sock_ptr) != 0 || sock_ptr == 0u) {
+                err = ERRNO_ENOTCONN;
+                ret = (uint32_t)-1;
+                break;
+            }
+            ns = (net_sock_t *)(uintptr_t)sock_ptr;
+            if (ns->sock_type != SOCK_TYPE_UDP) {
+                err = ERRNO_EOPNOTSUPP;
+                ret = (uint32_t)-1;
+                break;
+            }
+            port = ((uint16_t)sa[2] << 8) | sa[3];
+            if (net_udp_bind(ns, port) < 0) {
+                err = ERRNO_EINVAL;
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = 0u;
+            break;
+        }
         case SYS_LISTEN:
         case SYS_ACCEPT: {
             err = ERRNO_EOPNOTSUPP; ret = (uint32_t)-1; break;
@@ -1999,16 +2093,20 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 uint16_t port;
                 int n;
 
-                if (dest_addr == 0u || dest_len < 8u ||
-                    !abi_user_read_bytes(dest_addr, sa, (uint32_t)sizeof(sa))) {
-                    err = ERRNO_EINVAL;
-                    ret = (uint32_t)-1;
-                    break;
+                if (dest_addr == 0u) {
+                    n = net_send(ns, (const uint8_t *)(uintptr_t)buf_addr, len);
+                } else {
+                    if (dest_len < 8u ||
+                        !abi_user_read_bytes(dest_addr, sa, (uint32_t)sizeof(sa))) {
+                        err = ERRNO_EINVAL;
+                        ret = (uint32_t)-1;
+                        break;
+                    }
+                    ip = ((uint32_t)sa[4] << 24) | ((uint32_t)sa[5] << 16) |
+                         ((uint32_t)sa[6] << 8) | (uint32_t)sa[7];
+                    port = ((uint16_t)sa[2] << 8) | sa[3];
+                    n = net_udp_sendto(ns, ip, port, (const uint8_t *)(uintptr_t)buf_addr, len);
                 }
-                ip = ((uint32_t)sa[4] << 24) | ((uint32_t)sa[5] << 16) |
-                     ((uint32_t)sa[6] << 8) | (uint32_t)sa[7];
-                port = ((uint16_t)sa[2] << 8) | sa[3];
-                n = net_udp_sendto(ns, ip, port, (const uint8_t *)(uintptr_t)buf_addr, len);
                 if (n < 0) {
                     err = ERRNO_EIO;
                     ret = (uint32_t)-1;

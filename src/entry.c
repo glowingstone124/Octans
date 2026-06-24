@@ -3,6 +3,7 @@
 #include "../include/kernel/fs.h"
 #include "../include/kernel/irq.h"
 #include "../include/kernel/init_task.h"
+#include "../include/kernel/iommu.h"
 #include "../include/kernel/kernel.h"
 #include "../include/kernel/mmu.h"
 #include "../include/kernel/platform.h"
@@ -48,6 +49,7 @@ void kernel_entry(void) {
     KLOGI("kernel", "LAMP KERNEL V0.31 boot");
     vm_info_log_boot();
     mmu_init();
+    iommu_init();
     /* Kernel owns IVT policy after BIOS handoff. */
     trap_init();
     irq_input_init();

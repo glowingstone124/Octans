@@ -1626,6 +1626,9 @@ int fs_ext4_open(const char *path, uint32_t flags) {
         return rc;
     }
     rc = ext4_lookup_path_locked(path, &ino, &mode, &size);
+    if (rc == 0 && (flags & SYS_O_CREAT) != 0u && (flags & SYS_O_EXCL) != 0u) {
+        rc = FS_ERR_EXIST;
+    }
     if (rc == FS_ERR_NOENT && (flags & SYS_O_CREAT) != 0u) {
         rc = ext4_create_regular_locked(path, &ino);
         if (rc == 0) {

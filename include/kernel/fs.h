@@ -7,6 +7,7 @@ enum {
     FS_ERR_NOENT = -2,
     FS_ERR_IO = -5,
     FS_ERR_BADF = -9,
+    FS_ERR_EXIST = -17,
     FS_ERR_BUSY = -16,
     FS_ERR_NOTDIR = -20,
     FS_ERR_ISDIR = -21,

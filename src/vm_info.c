@@ -4,6 +4,9 @@
 
 #define VM_INFO_TAG "vm_info"
 
+static boot_info_t g_boot_info_cache;
+static uint32_t g_boot_info_cache_valid;
+
 static inline uint32_t vm_read32(uint32_t addr) {
     return *(volatile uint32_t *)(uintptr_t)addr;
 }
@@ -17,6 +20,10 @@ int vm_info_load_boot(boot_info_t *out) {
     out->version = vm_read32(BOOTINFO_ADDR + 0x04u);
     out->size = vm_read32(BOOTINFO_ADDR + 0x08u);
     if (out->magic != BOOTINFO_MAGIC || out->version != BOOTINFO_VERSION || out->size < BOOTINFO_SIZE) {
+        if (g_boot_info_cache_valid) {
+            *out = g_boot_info_cache;
+            return 1;
+        }
         return 0;
     }
 
@@ -41,6 +48,8 @@ int vm_info_load_boot(boot_info_t *out) {
     out->fb_stride_bytes = vm_read32(BOOTINFO_ADDR + 0x58u);
     out->boot_realtime_ns_lo = vm_read32(BOOTINFO_ADDR + 0x5Cu);
     out->boot_realtime_ns_hi = vm_read32(BOOTINFO_ADDR + 0x60u);
+    g_boot_info_cache = *out;
+    g_boot_info_cache_valid = 1u;
     return 1;
 }
 
