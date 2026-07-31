@@ -754,6 +754,7 @@ int user_exec_execve_current(const char *path, const char *const argv[], const c
 
     sched_task_set_kind(SCHED_TASK_KIND_USER);
     sched_task_set_exec_state(SCHED_EXEC_STATE_USER);
+    sched_signal_exec_reset();
     irq_enable(IRQ_TIMER);
     user_exec_cpu_ctx_write32(IO_CPU_CTX_IRQ_MASK, 1u);
     user_exec_enter_iret_current(img.entry, img.stack_ptr);

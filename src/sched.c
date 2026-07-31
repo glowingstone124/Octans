@@ -9,6 +9,9 @@
 
 volatile unsigned int g_ticks;
 volatile unsigned int g_need_resched;
+static uint32_t g_user_ticks;
+static uint32_t g_system_ticks;
+static uint32_t g_idle_ticks;
 sched_task_slot_t g_tasks[SCHED_MAX_TASKS];
 uint32_t g_cpu_current_idx[SCHED_MAX_CPUS];
 uint32_t g_next_tid;
@@ -78,10 +81,6 @@ extern void sched_ctx_swap(sched_stack_ctx_t *from, const sched_stack_ctx_t *to)
 extern void sched_ctx_capture(sched_stack_ctx_t *out);
 
 static void sched_task_bootstrap(void);
-
-static inline void sched_cpu_ctx_write32(uint32_t io_addr, uint32_t value) {
-    __asm__ volatile("out %0, %1" :: "r"(value), "r"(io_addr));
-}
 
 __asm__(
     ".text\n"
@@ -628,6 +627,9 @@ void sched_init(void) {
     }
 
     g_ticks = 0u;
+    g_user_ticks = 0u;
+    g_system_ticks = 0u;
+    g_idle_ticks = 0u;
     g_need_resched = 0u;
     sched_stack_pool_init_locked();
     for (uint32_t i = 0u; i < SCHED_MAX_CPUS; i++) {
@@ -681,6 +683,13 @@ void schedule_tick(void) {
     cur_idx = *sched_cpu_current_idx_ptr();
     if (cur_idx < SCHED_MAX_TASKS) {
         sched_task_slot_t *slot = &g_tasks[cur_idx];
+        if (!slot->used || slot->is_idle) {
+            g_idle_ticks++;
+        } else if (slot->pub.kind == SCHED_TASK_KIND_USER) {
+            g_user_ticks++;
+        } else {
+            g_system_ticks++;
+        }
         if (slot->used && !slot->is_idle && slot->pub.state == SCHED_TASK_RUNNING) {
             slot->quantum_used++;
             if (slot->quantum_used >= SCHED_QUANTUM_TICKS) {
@@ -697,6 +706,48 @@ unsigned int sched_ticks(void) {
     v = g_ticks;
     spinlock_unlock(&g_sched_lock);
     return v;
+}
+
+void sched_stats_snapshot(sched_stats_t *out) {
+    if (!out) {
+        return;
+    }
+    spinlock_lock(&g_sched_lock);
+    out->ticks = g_ticks;
+    out->user_ticks = g_user_ticks;
+    out->system_ticks = g_system_ticks;
+    out->idle_ticks = g_idle_ticks;
+    out->task_count = 0u;
+    out->runnable_tasks = 0u;
+    out->running_tasks = 0u;
+    out->sleeping_tasks = 0u;
+    out->blocked_tasks = 0u;
+    out->zombie_tasks = 0u;
+    out->user_tasks = 0u;
+    out->stack_bytes = 0u;
+    out->online_cpus = sched_cpu_cap();
+    for (uint32_t i = 0u; i < SCHED_MAX_TASKS; i++) {
+        const sched_task_slot_t *slot = &g_tasks[i];
+        if (!slot->used || slot->is_idle) {
+            continue;
+        }
+        out->task_count++;
+        if (slot->pub.kind == SCHED_TASK_KIND_USER) {
+            out->user_tasks++;
+        }
+        if (slot->stack_ctx.valid) {
+            out->stack_bytes += VM_STACK_SLOT_BYTES;
+        }
+        switch (slot->pub.state) {
+            case SCHED_TASK_RUNNABLE: out->runnable_tasks++; break;
+            case SCHED_TASK_RUNNING: out->running_tasks++; break;
+            case SCHED_TASK_SLEEPING: out->sleeping_tasks++; break;
+            case SCHED_TASK_BLOCKED: out->blocked_tasks++; break;
+            case SCHED_TASK_ZOMBIE: out->zombie_tasks++; break;
+            default: break;
+        }
+    }
+    spinlock_unlock(&g_sched_lock);
 }
 
 int sched_current_tid(void) {

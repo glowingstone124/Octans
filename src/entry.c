@@ -1,6 +1,9 @@
 #include "../include/kernel/console.h"
+#include "../include/kernel/audio.h"
 #include "../include/kernel/console_fb.h"
 #include "../include/kernel/fs.h"
+#include "../include/kernel/gpu.h"
+#include "../include/kernel/graphics.h"
 #include "../include/kernel/irq.h"
 #include "../include/kernel/init_task.h"
 #include "../include/kernel/iommu.h"
@@ -15,6 +18,7 @@
 #include "../include/kernel/types.h"
 #include "../include/kernel/vm_info.h"
 #include "../include/kernel/panic.h"
+#include "../include/kernel/pci.h"
 #include "net/net.h"
 static volatile uint32_t g_kernel_booted;
 
@@ -54,7 +58,11 @@ void kernel_entry(void) {
     trap_init();
     irq_input_init();
     syscall_init();
+    pci_init();
+    gpu_init();
+    audio_init();
     ether_init();
+    graphics_init();
     KLOGI("trap", "ready, input irq enabled");
     KLOGI("syscall", "irq 0x80 dispatch ready");
 

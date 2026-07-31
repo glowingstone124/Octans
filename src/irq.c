@@ -1,6 +1,9 @@
 #include "../include/kernel/blk.h"
+#include "../include/kernel/audio.h"
 #include "../include/kernel/console.h"
 #include "../include/kernel/irq.h"
+#include "../include/kernel/gpu.h"
+#include "../include/kernel/graphics.h"
 #include "../include/kernel/panic.h"
 #include "../include/kernel/platform.h"
 #include "net/net.h"
@@ -9,9 +12,14 @@
 #include "../include/kernel/syscall.h"
 #include "../include/kernel/trap.h"
 #include "../include/kernel/types.h"
+#include "../include/kernel/wm.h"
 
 #define STR1(x) #x
 #define STR(x) STR1(x)
+#define VM_ISR_STACK_ENTRY_SHIFT 11u
+
+_Static_assert((1u << VM_ISR_STACK_ENTRY_SHIFT) == VM_ISR_STACK_ENTRIES,
+               "IRQ frame indexing must match the per-CPU ISR stack size");
 
 volatile uint32_t g_irq_stub_no[32];
 volatile uint32_t g_irq_stub_r0[32];
@@ -42,6 +50,8 @@ static volatile uint32_t g_ps2_kbd_ctrl_l;
 static volatile uint32_t g_ps2_kbd_ctrl_r;
 static volatile uint32_t g_ps2_kbd_caps_lock;
 static volatile uint32_t g_ps2_kbd_ext;
+static uint8_t g_ps2_mouse_packet[3];
+static uint32_t g_ps2_mouse_packet_index;
 
 static const uint8_t g_ps2_kbd_ascii_plain[128] = {
     [0x01] = 0x1Bu,
@@ -157,6 +167,12 @@ static void ps2_keyboard_handle_scancode(uint8_t scancode) {
     uint32_t ctrl;
     uint8_t out = 0u;
 
+    /* The graphical VM Display reserves PS/2 input for a future GUI event
+     * queue. Interactive text input remains on the serial console. */
+    if (graphics_active()) {
+        return;
+    }
+
     if (scancode == 0xE0u) {
         g_ps2_kbd_ext = 1u;
         return;
@@ -230,11 +246,51 @@ static void ps2_keyboard_drain_rx(void) {
 }
 
 static void ps2_mouse_drain_rx(void) {
+    int32_t accumulated_dx = 0;
+    int32_t accumulated_dy = 0;
+    uint32_t accumulated_buttons = 0u;
+    uint32_t have_packet = 0u;
     while ((io_in32(IO_PS2_STATUS) & PS2_STATUS_OUT_FULL) != 0u) {
         if ((io_in32(IO_PS2_STATUS) & PS2_STATUS_AUX_DATA) == 0u) {
-            return;
+            break;
         }
-        (void)io_in32(IO_PS2_DATA);
+        const uint8_t value = (uint8_t)(io_in32(IO_PS2_DATA) & 0xFFu);
+        if (g_ps2_mouse_packet_index == 0u && (value & 0x08u) == 0u) {
+            continue;
+        }
+        g_ps2_mouse_packet[g_ps2_mouse_packet_index++] = value;
+        if (g_ps2_mouse_packet_index == 3u) {
+            int32_t dx;
+            int32_t dy;
+            uint32_t buttons;
+            const uint8_t flags = g_ps2_mouse_packet[0];
+            const uint8_t raw_x = g_ps2_mouse_packet[1];
+            const uint8_t raw_y = g_ps2_mouse_packet[2];
+            g_ps2_mouse_packet_index = 0u;
+            dx = (raw_x & 0x80u) != 0u ?
+                (int32_t)((uint32_t)raw_x | 0xFFFFFF00u) : (int32_t)raw_x;
+            dy = (raw_y & 0x80u) != 0u ?
+                (int32_t)((uint32_t)raw_y | 0xFFFFFF00u) : (int32_t)raw_y;
+            if ((flags & 0x40u) != 0u) dx = 0;
+            if ((flags & 0x80u) != 0u) dy = 0;
+            buttons = flags & 0x07u;
+            if (have_packet && buttons != accumulated_buttons) {
+                wm_pointer_event(accumulated_dx, accumulated_dy,
+                                 accumulated_buttons);
+                accumulated_dx = 0;
+                accumulated_dy = 0;
+                have_packet = 0u;
+            }
+            accumulated_dx += dx;
+            /* PS/2 Y grows upward; framebuffer Y grows downward. */
+            accumulated_dy -= dy;
+            accumulated_buttons = buttons;
+            have_packet = 1u;
+        }
+    }
+    if (have_packet) {
+        wm_pointer_event(accumulated_dx, accumulated_dy,
+                         accumulated_buttons);
     }
 }
 
@@ -266,6 +322,12 @@ void irq_common_entry(uint32_t irq_no) {
         case IRQ_ETHER:
             irq_ether(irq_no);
             break;
+        case IRQ_GPU:
+            irq_gpu(irq_no);
+            break;
+        case IRQ_AUDIO:
+            irq_audio(irq_no);
+            break;
         case IRQ_DIVIDE_BY_ZERO:
             irq_divide_by_zero(irq_no);
             break;
@@ -277,13 +339,18 @@ void irq_common_entry(uint32_t irq_no) {
 }
 
 void irq_common_entry_from_stub(void) {
-    if (g_irq_stub_from_user[irq_stub_cpu_index()] != 0u) {
+    const uint32_t cpu = irq_stub_cpu_index();
+    if (g_irq_stub_from_user[cpu] != 0u) {
         sched_save_current_user_irq_ctx();
     }
-    irq_common_entry(g_irq_stub_no[irq_stub_cpu_index()]);
+    irq_common_entry(g_irq_stub_no[cpu]);
+    if (g_irq_stub_from_user[cpu] != 0u) {
+        sched_signal_deliver_pending();
+    }
 }
 
 void irq_input_init(void) {
+    g_ps2_mouse_packet_index = 0u;
     io_out32(IO_SERIAL_STATUS, SERIAL_CTRL_RX_INT_ENABLE);
     ps2_write_controller(0xADu);
     ps2_write_controller(0xA7u);
@@ -366,6 +433,78 @@ void irq_saved_user_ctx_set(uint32_t csp, uint32_t dsp, uint32_t call_base, uint
     g_irq_saved_user_data_base[cpu] = data_base;
 }
 
+static inline uint32_t irq_isr_slot_read32(uint32_t isr_base, uint32_t index) {
+    return *(volatile uint32_t *)(uintptr_t)(isr_base + index * 8u);
+}
+
+static inline void irq_isr_slot_write32(uint32_t isr_base, uint32_t index, uint32_t value) {
+    volatile uint32_t *slot = (volatile uint32_t *)(uintptr_t)(isr_base + index * 8u);
+    slot[0] = value;
+    slot[1] = 0u;
+}
+
+int irq_user_context_get(irq_user_context_t *ctx) {
+    uint32_t cpu;
+    uint32_t isp;
+    uint32_t isr_base;
+    uint32_t frame_index;
+    if (!ctx) {
+        return -1;
+    }
+    cpu = irq_stub_cpu_index();
+    if (g_irq_stub_from_user[cpu] == 0u) {
+        return -1;
+    }
+    isp = io_in32(IO_CPU_CTX_ISP);
+    isr_base = io_in32(IO_CPU_CTX_ISR_BASE);
+    if (isp > VM_ISR_STACK_ENTRIES - 34u || isr_base == 0u) {
+        return -1;
+    }
+    for (uint32_t reg = 0u; reg < 32u; reg++) {
+        ctx->regs[reg] = irq_isr_slot_read32(isr_base, isp + (31u - reg));
+    }
+    ctx->flags = irq_isr_slot_read32(isr_base, isp + 32u);
+    ctx->ip = irq_isr_slot_read32(isr_base, isp + 33u);
+    ctx->csp = g_irq_saved_user_csp[cpu];
+    ctx->dsp = g_irq_saved_user_dsp[cpu];
+    ctx->call_base = g_irq_saved_user_call_base[cpu];
+    ctx->data_base = g_irq_saved_user_data_base[cpu];
+    frame_index = cpu * VM_ISR_STACK_ENTRIES + isp;
+    ctx->irq_masked = g_irq_frame_irq_masked[frame_index];
+    return 0;
+}
+
+int irq_user_context_set(const irq_user_context_t *ctx) {
+    uint32_t cpu;
+    uint32_t isp;
+    uint32_t isr_base;
+    uint32_t frame_index;
+    if (!ctx || ctx->csp > VM_CALL_STACK_ENTRIES || ctx->dsp > VM_DATA_STACK_ENTRIES) {
+        return -1;
+    }
+    cpu = irq_stub_cpu_index();
+    if (g_irq_stub_from_user[cpu] == 0u) {
+        return -1;
+    }
+    isp = io_in32(IO_CPU_CTX_ISP);
+    isr_base = io_in32(IO_CPU_CTX_ISR_BASE);
+    if (isp > VM_ISR_STACK_ENTRIES - 34u || isr_base == 0u) {
+        return -1;
+    }
+    for (uint32_t reg = 0u; reg < 32u; reg++) {
+        irq_isr_slot_write32(isr_base, isp + (31u - reg), ctx->regs[reg]);
+    }
+    irq_isr_slot_write32(isr_base, isp + 32u, ctx->flags);
+    irq_isr_slot_write32(isr_base, isp + 33u, ctx->ip);
+    g_irq_saved_user_csp[cpu] = ctx->csp;
+    g_irq_saved_user_dsp[cpu] = ctx->dsp;
+    g_irq_saved_user_call_base[cpu] = ctx->call_base;
+    g_irq_saved_user_data_base[cpu] = ctx->data_base;
+    frame_index = cpu * VM_ISR_STACK_ENTRIES + isp;
+    g_irq_frame_irq_masked[frame_index] = ctx->irq_masked ? 1u : 0u;
+    return 0;
+}
+
 void irq_default(uint32_t irq_no) {
     if (irq_no < KERNEL_IVT_SIZE) {
         g_irq_counts[irq_no]++;
@@ -409,6 +548,16 @@ void irq_mouse(uint32_t irq_no) {
 void irq_ether(uint32_t irq_no) {
     if (irq_no < KERNEL_IVT_SIZE) g_irq_counts[irq_no]++;
     ether_irq_handler();
+}
+
+void irq_gpu(uint32_t irq_no) {
+    if (irq_no < KERNEL_IVT_SIZE) g_irq_counts[irq_no]++;
+    gpu_irq_handler();
+}
+
+void irq_audio(uint32_t irq_no) {
+    if (irq_no < KERNEL_IVT_SIZE) g_irq_counts[irq_no]++;
+    audio_irq_handler();
 }
 
 void irq_timer(uint32_t irq_no) {
@@ -460,7 +609,7 @@ __asm__(
     "  movi r1, " STR(IO_CPU_CTX_ISP) "\n"
     "  in r18, r1\n"
     "  mov r19, r15\n"
-    "  shli r19, r19, 8\n"
+    "  shli r19, r19, " STR(VM_ISR_STACK_ENTRY_SHIFT) "\n"
     "  add r19, r19, r18\n"
     "  shli r19, r19, 2\n"
     "  movi r0, " STR(IO_CPU_CTX_ISR_BASE) "\n"
@@ -583,7 +732,7 @@ __asm__(
     "  movi r1, " STR(IO_CPU_CTX_ISP) "\n"
     "  in r18, r1\n"
     "  mov r19, r7\n"
-    "  shli r19, r19, 8\n"
+    "  shli r19, r19, " STR(VM_ISR_STACK_ENTRY_SHIFT) "\n"
     "  add r19, r19, r18\n"
     "  shli r19, r19, 2\n"
     "  add r7, r7, r7\n"
@@ -618,11 +767,15 @@ __asm__(
     "  load32 r3, r0, 0\n"
     "  movi r1, " STR(IO_CPU_CTX_DSP) "\n"
     "  out r3, r1\n"
+    ".Lirq_skip_user_ctx_restore:\n"
+    /* IRQ masking is CPU state, not user-stack state. It is saved for every
+     * interrupt at entry and therefore must be restored for both kernel- and
+     * user-originated interrupts. Keeping this inside the user-only branch
+     * left kernel execution permanently masked after its first IRQ. */
     "  movi r0, g_irq_frame_irq_masked\n"
     "  add r0, r0, r19\n"
     "  load32 r1, r0, 0\n"
     "  movi r0, " STR(IO_CPU_CTX_IRQ_MASK) "\n"
     "  out r1, r0\n"
-    ".Lirq_skip_user_ctx_restore:\n"
     "  iret\n"
 );

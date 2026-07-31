@@ -43,7 +43,7 @@ static void iommu_build_disk_page_table(void) {
         uint32_t pte = (iova >> IOMMU_PTE_SHIFT) & 0x3FFu;
         uint32_t table = page / IOMMU_L2_ENTRIES;
 
-        g_iommu_l2[table][pte] = (pa & 0xFFFFF000u) | IOMMU_PTE_P;
+        g_iommu_l2[table][pte] = (pa & 0xFFFFF000u) | IOMMU_PTE_P | IOMMU_PTE_R | IOMMU_PTE_W;
         g_iommu_l1[pde] = ((uint32_t)(uintptr_t)&g_iommu_l2[table][0] & 0xFFFFF000u) | IOMMU_PTE_P;
     }
 }
@@ -82,7 +82,7 @@ void iommu_init(void) {
 
     cap = mmio_read32(IOMMU_MMIO_BASE + IOMMU_REG_CAP);
     devs = cap & 0xFFu;
-    if (devs <= IOMMU_DEV_ETHER) {
+    if (devs <= IOMMU_DEV_AUDIO) {
         KLOGW(IOMMU_TAG, "invalid cap, bypass");
         return;
     }
@@ -92,11 +92,12 @@ void iommu_init(void) {
     mmio_write32(IOMMU_MMIO_BASE + IOMMU_REG_CTRL, 0u);
     iommu_program_device(IOMMU_DEV_DISK);
     iommu_program_device(IOMMU_DEV_ETHER);
+    iommu_program_device(IOMMU_DEV_AUDIO);
     mmio_write32(IOMMU_MMIO_BASE + IOMMU_REG_FAULT_STATUS, 1u);
     mmio_write32(IOMMU_MMIO_BASE + IOMMU_REG_CTRL, IOMMU_CTRL_ENABLE);
 
     g_iommu_active = 1u;
-    KLOGI(IOMMU_TAG, "enabled paged iova for disk/ether");
+    KLOGI(IOMMU_TAG, "enabled paged iova for disk/ether/audio");
 }
 
 uint32_t iommu_active(void) {

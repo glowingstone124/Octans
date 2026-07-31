@@ -480,7 +480,20 @@ static inline uint32_t fd_read_ready(int32_t fd) {
         return sched_fd_pipe_read_ready(fd);
     }
     if (t == SCHED_FD_TYPE_SOCKET) {
-        return 1u;
+        uint32_t sock_ptr = 0u;
+        net_sock_t *ns;
+
+        if (sched_fd_sock_get(fd, &sock_ptr) != SCHED_FD_OK || sock_ptr == 0u) {
+            return 0u;
+        }
+        ns = (net_sock_t *)(uintptr_t)sock_ptr;
+        if (ns->sock_type == SOCK_TYPE_TCP) {
+            /* Buffered bytes and EOF must both wake poll/select. */
+            if (ns->tcp.rx_len != 0u || ns->tcp.state != TCP_ESTABLISHED) {
+                return 1u;
+            }
+        }
+        return ether_rx_ready() ? 1u : 0u;
     }
     return 0u;
 }
@@ -1916,6 +1929,16 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
         }
         case SYS_KILL: {
             int rc = sched_signal_kill((int32_t)regs->arg0, regs->arg1);
+            if (rc != SCHED_SIGNAL_OK) {
+                err = errno_from_sched_signal_rc(rc);
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = 0u;
+            break;
+        }
+        case SYS_SIGRETURN: {
+            int rc = sched_signal_sigreturn(regs->arg0);
             if (rc != SCHED_SIGNAL_OK) {
                 err = errno_from_sched_signal_rc(rc);
                 ret = (uint32_t)-1;

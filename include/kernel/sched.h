@@ -14,6 +14,22 @@ typedef struct sched_sigaction32 {
     uint32_t restorer;
 } sched_sigaction32_t;
 
+typedef struct sched_stats {
+    uint32_t ticks;
+    uint32_t user_ticks;
+    uint32_t system_ticks;
+    uint32_t idle_ticks;
+    uint32_t task_count;
+    uint32_t runnable_tasks;
+    uint32_t running_tasks;
+    uint32_t sleeping_tasks;
+    uint32_t blocked_tasks;
+    uint32_t zombie_tasks;
+    uint32_t user_tasks;
+    uint32_t stack_bytes;
+    uint32_t online_cpus;
+} sched_stats_t;
+
 enum {
     SCHED_MAX_TASKS = 64u,
     SCHED_NAME_MAX = 16u,
@@ -29,6 +45,7 @@ enum {
     SCHED_SIGNAL_INT = 2u,
     SCHED_SIGNAL_QUIT = 3u,
     SCHED_SIGNAL_KILL = 9u,
+    SCHED_SIGNAL_SEGV = 11u,
     SCHED_SIGNAL_TERM = 15u,
     SCHED_SIGNAL_CHLD = 17u,
     SCHED_SIGNAL_STOP = 19u
@@ -189,6 +206,9 @@ uint32_t sched_task_get_exec_state(void);
 int sched_signal_action(uint32_t sig, const sched_sigaction32_t *act, sched_sigaction32_t *oldact);
 int sched_signal_mask(uint32_t how, uint32_t set, uint32_t *oldset);
 int sched_signal_kill(int32_t pid, uint32_t sig);
+int sched_signal_sigreturn(uint32_t frame_addr);
+void sched_signal_deliver_pending(void);
+void sched_signal_exec_reset(void);
 
 void sched_waitq_init(sched_waitq_t *q);
 void sched_waitq_sleep(sched_waitq_t *q, uint32_t timeout_ticks);
@@ -201,5 +221,6 @@ void sched_save_current_user_irq_ctx(void);
 void sched_run(void);
 void schedule_tick(void);
 unsigned int sched_ticks(void);
+void sched_stats_snapshot(sched_stats_t *out);
 
 #endif

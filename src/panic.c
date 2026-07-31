@@ -1,4 +1,5 @@
 #include "../include/kernel/console_fb.h"
+#include "../include/kernel/gpu.h"
 #include "../include/kernel/irq.h"
 #include "../include/kernel/panic.h"
 #include "../include/kernel/printk.h"
@@ -11,6 +12,8 @@ static void panic_halt(void) {
 }
 
 static void kpanic_emit_prefix(void) {
+    gpu_cursor_update(0u, 0u, 0u, 0u);
+    console_fb_set_text_output(1u);
     console_fb_set_colors(0x00FFFFFFu, 0x00800000u);
     console_fb_clear();
     KLOGE("panic", "kernel panic");

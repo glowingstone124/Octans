@@ -35,10 +35,6 @@ static inline void intc_write_priority(uint32_t irq_no, uint32_t priority) {
     mmio_write32(INTC_MMIO_BASE + INTC_REG_PRIORITY + irq_no * 4u, priority & 0xFFu);
 }
 
-static inline void intc_write_eoi(uint32_t irq_no) {
-    mmio_write32(INTC_MMIO_BASE + INTC_REG_EOI, irq_no);
-}
-
 static inline void intc_sync_enable_word(uint32_t word_index) {
     if (!g_intc_mmio_ready) {
         return;
@@ -163,6 +159,8 @@ void trap_init(void) {
     trap_register(IRQ_KEYBOARD, irq_keyboard);
     trap_register(IRQ_MOUSE, irq_mouse);
     trap_register(IRQ_ETHER, irq_ether);
+    trap_register(IRQ_GPU, irq_gpu);
+    trap_register(IRQ_AUDIO, irq_audio);
     trap_register(IRQ_TIMER, irq_timer);
     trap_register(IRQ_SYSCALL, irq_syscall);
 
@@ -171,8 +169,12 @@ void trap_init(void) {
     irq_set_priority(IRQ_TIMER, 0xC0u);
     irq_set_priority(IRQ_SERIAL, 0xB0u);
     irq_set_priority(IRQ_KEYBOARD, 0xB0u);
-    irq_set_priority(IRQ_MOUSE, 0xB0u);
+    /* Pointer motion is latency-sensitive and only performs a short cursor
+     * register update; keep it above timer and ordinary device completion. */
+    irq_set_priority(IRQ_MOUSE, 0xD0u);
     irq_set_priority(IRQ_ETHER, 0xA0u);
+    irq_set_priority(IRQ_GPU, 0xA0u);
+    irq_set_priority(IRQ_AUDIO, 0xA0u);
     irq_set_priority(IRQ_DISK_COMPLETE, 0xA0u);
 
     irq_enable(IRQ_DIVIDE_BY_ZERO);
@@ -181,6 +183,8 @@ void trap_init(void) {
     irq_enable(IRQ_KEYBOARD);
     irq_enable(IRQ_MOUSE);
     irq_enable(IRQ_ETHER);
+    irq_enable(IRQ_GPU);
+    irq_enable(IRQ_AUDIO);
     irq_enable(IRQ_SYSCALL);
 
     g_trap_ready = 1u;

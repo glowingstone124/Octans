@@ -88,6 +88,7 @@ typedef struct sched_task_slot {
     uint32_t file_umask;
     uint32_t sig_mask;
     uint32_t sig_pending;
+    uint32_t sig_frame_top;
     sched_sigaction32_t sig_action[SCHED_SIGNAL_MAX + 1u];
     spinlock_t fd_lock;
 } sched_task_slot_t;

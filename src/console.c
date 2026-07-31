@@ -42,7 +42,10 @@ static void console_echo_data_char(uint8_t c) {
         c == (uint8_t)'\t' || c == (uint8_t)'\v' || c == (uint8_t)'\f' ||
         (c >= (uint8_t)' ' && c <= (uint8_t)'~')) {
         kio_lock();
-        console_fb_putc((uint32_t)c);
+        console_io_out32(IO_SERIAL_TX, (uint32_t)c);
+        if (console_fb_text_output_enabled()) {
+            console_fb_putc((uint32_t)c);
+        }
         kio_unlock();
     }
 }
@@ -52,7 +55,10 @@ static void console_echo_backspace(void) {
         return;
     }
     kio_lock();
-    console_fb_putc((uint32_t)'\b');
+    console_io_out32(IO_SERIAL_TX, (uint32_t)'\b');
+    if (console_fb_text_output_enabled()) {
+        console_fb_putc((uint32_t)'\b');
+    }
     kio_unlock();
 }
 
@@ -61,9 +67,14 @@ static void console_echo_intr(void) {
         return;
     }
     kio_lock();
-    console_fb_putc((uint32_t)'^');
-    console_fb_putc((uint32_t)'C');
-    console_fb_putc((uint32_t)'\n');
+    console_io_out32(IO_SERIAL_TX, (uint32_t)'^');
+    console_io_out32(IO_SERIAL_TX, (uint32_t)'C');
+    console_io_out32(IO_SERIAL_TX, (uint32_t)'\n');
+    if (console_fb_text_output_enabled()) {
+        console_fb_putc((uint32_t)'^');
+        console_fb_putc((uint32_t)'C');
+        console_fb_putc((uint32_t)'\n');
+    }
     kio_unlock();
 }
 
@@ -343,7 +354,9 @@ uint32_t console_write(const uint8_t *src, uint32_t len) {
     kio_lock();
     for (n = 0u; n < len; n++) {
         console_io_out32(IO_SERIAL_TX, (uint32_t)src[n]);
-        console_fb_putc((uint32_t)src[n]);
+        if (console_fb_text_output_enabled()) {
+            console_fb_putc((uint32_t)src[n]);
+        }
     }
     kio_unlock();
     return n;

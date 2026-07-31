@@ -125,6 +125,16 @@ static void vm_info_log_features(uint32_t features) {
         klog_puts("ETHER");
         first = 0;
     }
+    if (features & BOOTINFO_FEATURE_PCIE) {
+        if (!first) klog_putc((uint32_t)' ');
+        klog_puts("PCIE");
+        first = 0;
+    }
+    if (features & BOOTINFO_FEATURE_RUNTIME_STATS) {
+        if (!first) klog_putc((uint32_t)' ');
+        klog_puts("RUNTIME_STATS");
+        first = 0;
+    }
     if (first) {
         klog_puts("none");
     }

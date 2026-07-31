@@ -21,7 +21,8 @@ enum {
 
 enum {
     FS_BACKEND_NONE = 0u,
-    FS_BACKEND_EXT4 = 1u
+    FS_BACKEND_EXT4 = 1u,
+    FS_BACKEND_PROC = 2u
 };
 
 typedef struct fs_stat {

@@ -14,6 +14,28 @@ static uint32_t g_vfork_snapshot_valid;
 static uint32_t g_vfork_snapshot_child_tid;
 
 enum {
+    SCHED_SIGNAL_FRAME_MAGIC = 0x30474953u, /* "SIG0" */
+    SCHED_SIGNAL_FRAME_VERSION = 1u
+};
+
+typedef struct sched_signal_frame {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t size;
+    uint32_t signo;
+    uint32_t prev_frame;
+    uint32_t old_mask;
+    uint32_t csp;
+    uint32_t dsp;
+    uint32_t call_base;
+    uint32_t data_base;
+    uint32_t irq_masked;
+    uint32_t flags;
+    uint32_t ip;
+    uint32_t regs[32];
+} sched_signal_frame_t;
+
+enum {
     SCHED_SYSCALL_ABI_OFF_MAGIC = 0x00u,
     SCHED_SYSCALL_ABI_OFF_VERSION = 0x04u,
     SCHED_SYSCALL_ABI_OFF_LAST_NR = 0x08u,
@@ -540,6 +562,7 @@ static int sched_vfork_trampoline(uint32_t abi_addr) {
     child->file_umask = self->file_umask;
     child->sig_mask = self->sig_mask;
     child->sig_pending = 0u;
+    child->sig_frame_top = self->sig_frame_top;
     for (uint32_t sig = 0u; sig <= SCHED_SIGNAL_MAX; sig++) {
         child->sig_action[sig] = self->sig_action[sig];
     }
@@ -779,6 +802,38 @@ static uint32_t sched_signal_is_default_terminate(uint32_t sig) {
             break;
     }
     return sched_signal_valid(sig);
+}
+
+static uint32_t sched_signal_user_code_addr(uint32_t addr) {
+    return addr >= USER_REGION_BASE && addr < USER_REGION_BASE + USER_REGION_SIZE;
+}
+
+static uint32_t sched_signal_user_stack_range(uint32_t addr, uint32_t size) {
+    const uint32_t floor = USER_STACK_TOP - USER_STACK_RESERVE;
+    if (size == 0u || addr < floor || addr >= USER_STACK_TOP) {
+        return 0u;
+    }
+    return size <= USER_STACK_TOP - addr;
+}
+
+static uint32_t sched_signal_arch_stack_valid(uint32_t base, uint32_t size) {
+    return base != 0u && base < KERNEL_MEM_SIZE && size <= KERNEL_MEM_SIZE - base;
+}
+
+static void sched_signal_frame_store(uint32_t addr, const sched_signal_frame_t *frame) {
+    volatile uint32_t *dst = (volatile uint32_t *)(uintptr_t)addr;
+    const uint32_t *src = (const uint32_t *)(const void *)frame;
+    for (uint32_t i = 0u; i < (uint32_t)sizeof(*frame) / 4u; i++) {
+        dst[i] = src[i];
+    }
+}
+
+static void sched_signal_frame_load(sched_signal_frame_t *frame, uint32_t addr) {
+    uint32_t *dst = (uint32_t *)(void *)frame;
+    volatile const uint32_t *src = (volatile const uint32_t *)(uintptr_t)addr;
+    for (uint32_t i = 0u; i < (uint32_t)sizeof(*frame) / 4u; i++) {
+        dst[i] = src[i];
+    }
 }
 
 static void sched_signal_wake_parent_locked(sched_task_slot_t *slot) {
@@ -1428,6 +1483,184 @@ int sched_signal_kill(int32_t pid, uint32_t sig) {
         sched_exit_code(128u + (sig & 0x7Fu));
     }
     return SCHED_SIGNAL_OK;
+}
+
+void sched_signal_deliver_pending(void) {
+    irq_user_context_t ctx;
+    sched_signal_frame_t frame;
+    sched_sigaction32_t action;
+    sched_task_slot_t *slot;
+    uint32_t deliverable;
+    uint32_t sig = 0u;
+    uint32_t sigbit;
+    uint32_t frame_addr;
+    uint32_t return_slot;
+
+    if (irq_user_context_get(&ctx) != 0) {
+        return;
+    }
+
+    spinlock_lock(&g_sched_lock);
+    slot = sched_current_slot();
+    if (!slot || !slot->used || slot->is_idle || slot->pub.kind != SCHED_TASK_KIND_USER) {
+        spinlock_unlock(&g_sched_lock);
+        return;
+    }
+
+    for (;;) {
+        deliverable = slot->sig_pending & ~slot->sig_mask;
+        if (deliverable == 0u) {
+            spinlock_unlock(&g_sched_lock);
+            return;
+        }
+        for (sig = 1u; sig <= SCHED_SIGNAL_MAX; sig++) {
+            if ((deliverable & sched_signal_bit(sig)) != 0u) {
+                break;
+            }
+        }
+        if (sig > SCHED_SIGNAL_MAX) {
+            spinlock_unlock(&g_sched_lock);
+            return;
+        }
+        sigbit = sched_signal_bit(sig);
+        action = slot->sig_action[sig];
+        slot->sig_pending &= ~sigbit;
+        if (action.handler == SCHED_SIGNAL_IGN ||
+            (action.handler == SCHED_SIGNAL_DFL && !sched_signal_is_default_terminate(sig))) {
+            continue;
+        }
+        break;
+    }
+
+    if (action.handler == SCHED_SIGNAL_DFL) {
+        spinlock_unlock(&g_sched_lock);
+        sched_exit_code(128u + (sig & 0x7Fu));
+    }
+
+    if (!sched_signal_user_code_addr(action.handler) ||
+        !sched_signal_user_code_addr(action.restorer) ||
+        ctx.csp == 0u || ctx.csp > VM_CALL_STACK_ENTRIES ||
+        ctx.dsp > VM_DATA_STACK_ENTRIES ||
+        !sched_signal_arch_stack_valid(ctx.call_base, VM_CALL_STACK_BYTES) ||
+        !sched_signal_arch_stack_valid(ctx.data_base, VM_DATA_STACK_BYTES) ||
+        ctx.regs[30] < (USER_STACK_TOP - USER_STACK_RESERVE) + (uint32_t)sizeof(frame) ||
+        ctx.regs[30] > USER_STACK_TOP) {
+        spinlock_unlock(&g_sched_lock);
+        sched_exit_code(128u + SCHED_SIGNAL_SEGV);
+    }
+
+    frame_addr = (ctx.regs[30] - (uint32_t)sizeof(frame)) & ~0xFu;
+    if (!sched_signal_user_stack_range(frame_addr, (uint32_t)sizeof(frame))) {
+        spinlock_unlock(&g_sched_lock);
+        sched_exit_code(128u + SCHED_SIGNAL_SEGV);
+    }
+
+    frame.magic = SCHED_SIGNAL_FRAME_MAGIC;
+    frame.version = SCHED_SIGNAL_FRAME_VERSION;
+    frame.size = (uint32_t)sizeof(frame);
+    frame.signo = sig;
+    frame.prev_frame = slot->sig_frame_top;
+    frame.old_mask = slot->sig_mask;
+    frame.csp = ctx.csp;
+    frame.dsp = ctx.dsp;
+    frame.call_base = ctx.call_base;
+    frame.data_base = ctx.data_base;
+    frame.irq_masked = ctx.irq_masked;
+    frame.flags = ctx.flags;
+    frame.ip = ctx.ip;
+    for (uint32_t reg = 0u; reg < 32u; reg++) {
+        frame.regs[reg] = ctx.regs[reg];
+    }
+    sched_signal_frame_store(frame_addr, &frame);
+
+    return_slot = ctx.call_base + (ctx.csp - 1u) * 8u;
+    *(volatile uint32_t *)(uintptr_t)return_slot = action.restorer;
+    *(volatile uint32_t *)(uintptr_t)(return_slot + 4u) = 0u;
+
+    ctx.csp--;
+    ctx.regs[0] = sig;
+    ctx.regs[1] = frame_addr;
+    ctx.regs[30] = frame_addr;
+    ctx.ip = action.handler;
+    slot->sig_mask = (slot->sig_mask | action.mask | sigbit) & ~sched_signal_uncatchable_mask();
+    slot->sig_frame_top = frame_addr;
+    spinlock_unlock(&g_sched_lock);
+
+    if (irq_user_context_set(&ctx) != 0) {
+        sched_exit_code(128u + SCHED_SIGNAL_SEGV);
+    }
+}
+
+int sched_signal_sigreturn(uint32_t frame_addr) {
+    irq_user_context_t ctx;
+    sched_signal_frame_t frame;
+    sched_task_slot_t *slot;
+
+    if (irq_user_context_get(&ctx) != 0 ||
+        !sched_signal_user_stack_range(frame_addr, (uint32_t)sizeof(frame))) {
+        return SCHED_SIGNAL_EINVAL;
+    }
+
+    spinlock_lock(&g_sched_lock);
+    slot = sched_current_slot();
+    if (!slot || !slot->used || slot->is_idle || slot->pub.kind != SCHED_TASK_KIND_USER ||
+        slot->sig_frame_top != frame_addr) {
+        spinlock_unlock(&g_sched_lock);
+        return SCHED_SIGNAL_EINVAL;
+    }
+    sched_signal_frame_load(&frame, frame_addr);
+    if (frame.magic != SCHED_SIGNAL_FRAME_MAGIC ||
+        frame.version != SCHED_SIGNAL_FRAME_VERSION ||
+        frame.size != (uint32_t)sizeof(frame) ||
+        !sched_signal_user_code_addr(frame.ip) ||
+        frame.regs[30] < USER_STACK_TOP - USER_STACK_RESERVE ||
+        frame.regs[30] > USER_STACK_TOP ||
+        frame.csp > VM_CALL_STACK_ENTRIES || frame.dsp > VM_DATA_STACK_ENTRIES ||
+        !sched_signal_arch_stack_valid(frame.call_base, VM_CALL_STACK_BYTES) ||
+        !sched_signal_arch_stack_valid(frame.data_base, VM_DATA_STACK_BYTES) ||
+        (frame.prev_frame != 0u &&
+         !sched_signal_user_stack_range(frame.prev_frame, (uint32_t)sizeof(frame)))) {
+        spinlock_unlock(&g_sched_lock);
+        return SCHED_SIGNAL_EINVAL;
+    }
+
+    for (uint32_t reg = 0u; reg < 32u; reg++) {
+        ctx.regs[reg] = frame.regs[reg];
+    }
+    ctx.flags = frame.flags;
+    ctx.ip = frame.ip;
+    ctx.csp = frame.csp;
+    ctx.dsp = frame.dsp;
+    ctx.call_base = frame.call_base;
+    ctx.data_base = frame.data_base;
+    ctx.irq_masked = frame.irq_masked;
+    slot->sig_mask = frame.old_mask & ~sched_signal_uncatchable_mask();
+    slot->sig_frame_top = frame.prev_frame;
+    spinlock_unlock(&g_sched_lock);
+
+    if (irq_user_context_set(&ctx) != 0) {
+        return SCHED_SIGNAL_EINVAL;
+    }
+    return SCHED_SIGNAL_OK;
+}
+
+void sched_signal_exec_reset(void) {
+    sched_task_slot_t *slot;
+    spinlock_lock(&g_sched_lock);
+    slot = sched_current_slot();
+    if (slot && slot->used && !slot->is_idle) {
+        slot->sig_pending = 0u;
+        slot->sig_frame_top = 0u;
+        for (uint32_t sig = 1u; sig <= SCHED_SIGNAL_MAX; sig++) {
+            if (slot->sig_action[sig].handler != SCHED_SIGNAL_IGN) {
+                slot->sig_action[sig].handler = SCHED_SIGNAL_DFL;
+                slot->sig_action[sig].flags = 0u;
+                slot->sig_action[sig].mask = 0u;
+                slot->sig_action[sig].restorer = 0u;
+            }
+        }
+    }
+    spinlock_unlock(&g_sched_lock);
 }
 
 int sched_current_getcwd(char *dst, uint32_t cap) {

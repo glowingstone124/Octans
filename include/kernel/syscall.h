@@ -54,7 +54,8 @@ enum {
     SYS_RMDIR = 47u,
     SYS_LINK = 48u,
     SYS_SYMLINK = 49u,
-    SYS_READLINK = 50u
+    SYS_READLINK = 50u,
+    SYS_SIGRETURN = 51u
 };
 
 enum {

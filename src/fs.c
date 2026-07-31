@@ -1,6 +1,7 @@
 #include "../include/kernel/blk.h"
 #include "../include/kernel/fs.h"
 #include "../include/kernel/fs_ext4.h"
+#include "../include/kernel/fs_proc.h"
 #include "../include/kernel/sched.h"
 #include "../include/kernel/syscall.h"
 
@@ -81,6 +82,9 @@ int fs_open(const char *path, uint32_t flags) {
     if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/') {
         return fs_open_dev(path, flags);
     }
+    if (fs_proc_path_match(path)) {
+        return fs_proc_open(path, flags);
+    }
     return fs_ext4_open(path, flags);
 }
 
@@ -90,6 +94,9 @@ int fs_stat(const char *path, fs_stat_t *st) {
     }
     if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/') {
         return fs_stat_dev(path, st);
+    }
+    if (fs_proc_path_match(path)) {
+        return fs_proc_stat(path, st);
     }
     return fs_ext4_stat(path, st);
 }
@@ -112,7 +119,8 @@ int fs_fstat(int32_t fd, fs_stat_t *st) {
         }
         st->st_dev = backend;
         st->st_ino = file_id;
-        st->st_mode = (is_dir ? SYS_S_IFDIR : SYS_S_IFREG) | 0644u;
+        st->st_mode = (is_dir ? SYS_S_IFDIR : SYS_S_IFREG) |
+            (backend == FS_BACKEND_PROC ? (is_dir ? 0555u : 0444u) : 0644u);
         st->st_nlink = 1u;
         st->st_uid = 0u;
         st->st_gid = 0u;
@@ -178,6 +186,9 @@ int fs_getdents(int32_t fd, fs_dirent_t *dst, uint32_t len) {
     if (backend == FS_BACKEND_EXT4) {
         return fs_ext4_getdents_fd(fd, dst, len);
     }
+    if (backend == FS_BACKEND_PROC) {
+        return fs_proc_getdents_fd(fd, dst, len);
+    }
     return FS_ERR_BADF;
 }
 
@@ -188,6 +199,9 @@ int fs_readlink(const char *path, uint8_t *dst, uint32_t len) {
     if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/') {
         return FS_ERR_INVAL;
     }
+    if (fs_proc_path_match(path)) {
+        return FS_ERR_INVAL;
+    }
     return fs_ext4_readlink(path, dst, len);
 }
 
@@ -196,6 +210,9 @@ int fs_unlink(const char *path) {
         return FS_ERR_INVAL;
     }
     if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/') {
+        return FS_ERR_ROFS;
+    }
+    if (fs_proc_path_match(path)) {
         return FS_ERR_ROFS;
     }
     return fs_ext4_unlink(path);
@@ -210,6 +227,13 @@ int fs_read(int32_t fd, uint8_t *dst, uint32_t len) {
         return FS_ERR_BADF;
     }
     if (t == SCHED_FD_TYPE_REGULAR) {
+        uint32_t backend = 0u;
+        if (sched_fd_regular_get(fd, &backend, 0, 0, 0, 0) != SCHED_FD_OK) {
+            return FS_ERR_BADF;
+        }
+        if (backend == FS_BACKEND_PROC) {
+            return fs_proc_read_fd(fd, dst, len);
+        }
         return fs_ext4_read_fd(fd, dst, len);
     }
     return FS_ERR_BADF;
@@ -224,6 +248,13 @@ int fs_write(int32_t fd, const uint8_t *src, uint32_t len) {
         return FS_ERR_BADF;
     }
     if (t == SCHED_FD_TYPE_REGULAR) {
+        uint32_t backend = 0u;
+        if (sched_fd_regular_get(fd, &backend, 0, 0, 0, 0) != SCHED_FD_OK) {
+            return FS_ERR_BADF;
+        }
+        if (backend == FS_BACKEND_PROC) {
+            return FS_ERR_ROFS;
+        }
         return fs_ext4_write_fd(fd, src, len);
     }
     return FS_ERR_BADF;

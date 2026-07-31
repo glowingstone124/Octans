@@ -10,6 +10,17 @@ typedef struct trap_frame {
     uint32_t reserved;
 } trap_frame_t;
 
+typedef struct irq_user_context {
+    uint32_t regs[32];
+    uint32_t flags;
+    uint32_t ip;
+    uint32_t csp;
+    uint32_t dsp;
+    uint32_t call_base;
+    uint32_t data_base;
+    uint32_t irq_masked;
+} irq_user_context_t;
+
 void irq_default(uint32_t irq_no);
 void irq_divide_by_zero(uint32_t irq_no);
 void irq_disk_complete(uint32_t irq_no);
@@ -18,6 +29,8 @@ void irq_serial_drain_rx(void);
 void irq_keyboard(uint32_t irq_no);
 void irq_mouse(uint32_t irq_no);
 void irq_ether(uint32_t irq_no);
+void irq_gpu(uint32_t irq_no);
+void irq_audio(uint32_t irq_no);
 void irq_timer(uint32_t irq_no);
 void irq_syscall(uint32_t irq_no);
 
@@ -38,5 +51,7 @@ uint32_t irq_saved_user_dsp(void);
 uint32_t irq_saved_user_call_base(void);
 uint32_t irq_saved_user_data_base(void);
 void irq_saved_user_ctx_set(uint32_t csp, uint32_t dsp, uint32_t call_base, uint32_t data_base);
+int irq_user_context_get(irq_user_context_t *ctx);
+int irq_user_context_set(const irq_user_context_t *ctx);
 
 #endif

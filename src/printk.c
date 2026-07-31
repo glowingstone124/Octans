@@ -28,7 +28,9 @@ static inline uint32_t vm_read32(uint32_t addr) {
 
 static inline void kputc_raw(uint32_t c) {
     io_out32(IO_SERIAL_TX, c & 0xFFu);
-    console_fb_putc(c);
+    if (console_fb_text_output_enabled()) {
+        console_fb_putc(c);
+    }
 }
 
 static inline void kputs_raw(const char *s) {
