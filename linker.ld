@@ -24,6 +24,20 @@ SECTIONS
     __data_end = .;
   }
 
+  /*
+   * Keep the two firmware/ABI pages immediately below 3 MiB out of all
+   * kernel sections.  The legacy syscall result mailbox lives at 0x2fe000
+   * and BIOS republishes BootInfo at 0x2ff000 after loading the ELF.  Letting
+   * an ordinary .bss allocation drift across either page makes the failure
+   * depend on link order (and previously corrupted an MMU L2 table).
+   *
+   * BIOS deliberately tolerates BSS zeroing its temporary ELF buffer at
+   * 0x300000 after the file-backed bytes have been copied.
+   */
+  ASSERT(__data_end <= 0x002FE000,
+         "kernel file-backed sections overlap syscall ABI/BootInfo pages")
+  . = MAX(., 0x00300000);
+
   .bss ALIGN(0x1000) : {
     __bss_start = .;
     *(.bss .bss.*)

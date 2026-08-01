@@ -2,6 +2,7 @@
 
 #include "../include/kernel/platform.h"
 #include "../include/kernel/printk.h"
+#include "../include/kernel/spinlock.h"
 #include "../include/kernel/vm_info.h"
 
 #define MMU_TAG "mmu"
@@ -20,6 +21,7 @@
 
 static volatile uint32_t g_mmu_enabled;
 static volatile uint32_t g_root_pa_lo;
+static spinlock_t g_mmu_map_lock;
 
 static uint32_t g_l1[MMU_L1_ENTRIES] __attribute__((aligned(4096)));
 static uint32_t g_l2[MMU_L2_TABLES][MMU_L2_ENTRIES] __attribute__((aligned(4096)));
@@ -136,10 +138,20 @@ static uint32_t mmu_enable_local(uint32_t root_pa_lo) {
     return (mmio_read32(MMU_MMIO_BASE + MMU_REG_CTRL) & 0x1u) ? 1u : 0u;
 }
 
+static void mmu_flush_all(void) {
+    if (!g_mmu_enabled) {
+        return;
+    }
+    __asm__ volatile("fence\n" ::: "memory");
+    mmio_write32(MMU_MMIO_BASE + MMU_REG_TLB_FLUSH,
+                 MMU_TLB_FLUSH_GLOBAL);
+}
+
 int mmu_map_identity(uint32_t va, uint32_t len, uint32_t prot) {
     uint32_t start;
     uint32_t end;
     uint32_t page;
+    int result = 0;
 
     if (len == 0u) {
         return 0;
@@ -154,16 +166,26 @@ int mmu_map_identity(uint32_t va, uint32_t len, uint32_t prot) {
         return -1;
     }
 
+    spinlock_lock(&g_mmu_map_lock);
     for (page = start; page < end; page += MMU_PAGE_SIZE) {
         if (mmu_map_identity_page(page, prot) != 0) {
-            return -1;
+            result = -1;
+            break;
         }
     }
-    return 0;
+    spinlock_unlock(&g_mmu_map_lock);
+    if (result == 0) {
+        /* Page tables are shared by every vCPU.  The MMU's global epoch
+         * invalidation is synchronous and avoids stale permissions on APs
+         * after the ELF loader tightens W+X mappings back to RX/R. */
+        mmu_flush_all();
+    }
+    return result;
 }
 
 void mmu_init(void) {
     boot_info_t info;
+    spinlock_init(&g_mmu_map_lock);
     g_mmu_enabled = 0u;
     g_root_pa_lo = 0u;
 
