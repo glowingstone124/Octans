@@ -27,6 +27,11 @@ static inline uint32_t vm_read32(uint32_t addr) {
 }
 
 static inline void kputc_raw(uint32_t c) {
+    /* Kernel diagnostics are terminal text, so keep their serial line endings
+     * canonical without feeding the extra CR into the framebuffer console. */
+    if ((c & 0xFFu) == (uint32_t)'\n') {
+        io_out32(IO_SERIAL_TX, (uint32_t)'\r');
+    }
     io_out32(IO_SERIAL_TX, c & 0xFFu);
     if (console_fb_text_output_enabled()) {
         console_fb_putc(c);

@@ -11,6 +11,7 @@ enum {
     CONSOLE_RX_CAP = 256u,
     CONSOLE_RX_MASK = CONSOLE_RX_CAP - 1u,
     TTY_LFLAG_SUPPORTED = TTY_LFLAG_ECHO | TTY_LFLAG_ICANON | TTY_LFLAG_ISIG,
+    TTY_OFLAG_SUPPORTED = TTY_OFLAG_OPOST | TTY_OFLAG_ONLCR,
     TTY_CC_VINTR = 0x03u,
     TTY_CC_VEOF = 0x04u,
     TTY_CC_VERASE_BS = 0x08u,
@@ -24,6 +25,7 @@ static volatile uint32_t g_rx_dropped;
 static volatile uint32_t g_rx_lines;
 static volatile uint32_t g_rx_eofs;
 static volatile uint32_t g_tty_lflag;
+static volatile uint32_t g_tty_oflag;
 static volatile uint32_t g_console_read_wait_count;
 static uint8_t g_rx_buf[CONSOLE_RX_CAP];
 static sched_waitq_t g_rx_waitq;
@@ -31,6 +33,21 @@ static spinlock_t g_rx_lock;
 
 static inline void console_io_out32(uint32_t addr, uint32_t value) {
     __asm__ volatile("out %0, %1" :: "r"(value), "r"(addr));
+}
+
+/* Apply the TTY output discipline only to the serial stream. The framebuffer
+ * console consumes logical characters and already handles LF itself. */
+static void console_output_char(uint8_t c) {
+    const uint32_t oflag = g_tty_oflag;
+    if (c == (uint8_t)'\n' &&
+        (oflag & (TTY_OFLAG_OPOST | TTY_OFLAG_ONLCR)) ==
+            (TTY_OFLAG_OPOST | TTY_OFLAG_ONLCR)) {
+        console_io_out32(IO_SERIAL_TX, (uint32_t)'\r');
+    }
+    console_io_out32(IO_SERIAL_TX, (uint32_t)c);
+    if (console_fb_text_output_enabled()) {
+        console_fb_putc((uint32_t)c);
+    }
 }
 
 static void console_echo_data_char(uint8_t c) {
@@ -42,10 +59,7 @@ static void console_echo_data_char(uint8_t c) {
         c == (uint8_t)'\t' || c == (uint8_t)'\v' || c == (uint8_t)'\f' ||
         (c >= (uint8_t)' ' && c <= (uint8_t)'~')) {
         kio_lock();
-        console_io_out32(IO_SERIAL_TX, (uint32_t)c);
-        if (console_fb_text_output_enabled()) {
-            console_fb_putc((uint32_t)c);
-        }
+        console_output_char(c);
         kio_unlock();
     }
 }
@@ -55,6 +69,10 @@ static void console_echo_backspace(void) {
         return;
     }
     kio_lock();
+    /* A terminal BS only moves the cursor. Canonical erase must also blank
+     * the old glyph and return to the edit position. */
+    console_io_out32(IO_SERIAL_TX, (uint32_t)'\b');
+    console_io_out32(IO_SERIAL_TX, (uint32_t)' ');
     console_io_out32(IO_SERIAL_TX, (uint32_t)'\b');
     if (console_fb_text_output_enabled()) {
         console_fb_putc((uint32_t)'\b');
@@ -67,14 +85,9 @@ static void console_echo_intr(void) {
         return;
     }
     kio_lock();
-    console_io_out32(IO_SERIAL_TX, (uint32_t)'^');
-    console_io_out32(IO_SERIAL_TX, (uint32_t)'C');
-    console_io_out32(IO_SERIAL_TX, (uint32_t)'\n');
-    if (console_fb_text_output_enabled()) {
-        console_fb_putc((uint32_t)'^');
-        console_fb_putc((uint32_t)'C');
-        console_fb_putc((uint32_t)'\n');
-    }
+    console_output_char((uint8_t)'^');
+    console_output_char((uint8_t)'C');
+    console_output_char((uint8_t)'\n');
     kio_unlock();
 }
 
@@ -126,6 +139,7 @@ void console_init(void) {
     g_rx_eofs = 0u;
     g_console_read_wait_count = 0u;
     g_tty_lflag = TTY_LFLAG_ECHO | TTY_LFLAG_ICANON | TTY_LFLAG_ISIG;
+    g_tty_oflag = TTY_OFLAG_OPOST | TTY_OFLAG_ONLCR;
     spinlock_init(&g_rx_lock);
     sched_waitq_init(&g_rx_waitq);
 }
@@ -272,6 +286,23 @@ uint32_t console_tty_set_lflag(uint32_t lflag) {
     return out;
 }
 
+uint32_t console_tty_get_oflag(void) {
+    uint32_t oflag;
+    spinlock_lock(&g_rx_lock);
+    oflag = g_tty_oflag;
+    spinlock_unlock(&g_rx_lock);
+    return oflag;
+}
+
+uint32_t console_tty_set_oflag(uint32_t oflag) {
+    uint32_t out;
+    spinlock_lock(&g_rx_lock);
+    g_tty_oflag = oflag & TTY_OFLAG_SUPPORTED;
+    out = g_tty_oflag;
+    spinlock_unlock(&g_rx_lock);
+    return out;
+}
+
 int console_read(uint8_t *dst, uint32_t len, uint32_t nonblock) {
     uint32_t n = 0u;
     uint32_t canonical;
@@ -353,10 +384,7 @@ uint32_t console_write(const uint8_t *src, uint32_t len) {
     }
     kio_lock();
     for (n = 0u; n < len; n++) {
-        console_io_out32(IO_SERIAL_TX, (uint32_t)src[n]);
-        if (console_fb_text_output_enabled()) {
-            console_fb_putc((uint32_t)src[n]);
-        }
+        console_output_char(src[n]);
     }
     kio_unlock();
     return n;

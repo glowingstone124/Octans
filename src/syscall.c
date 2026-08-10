@@ -545,7 +545,7 @@ static void termios_fill(syscall_termios32_t *t) {
         return;
     }
     t->c_iflag = 0u;
-    t->c_oflag = 0u;
+    t->c_oflag = console_tty_get_oflag();
     t->c_cflag = 0u;
     t->c_lflag = termios_lflag_from_console(console_tty_get_lflag());
     for (uint32_t i = 0u; i < SYS_TERMIOS_NCCS; i++) {
@@ -1844,6 +1844,7 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                     break;
                 }
                 (void)console_tty_set_lflag(console_lflag_from_termios(termios.c_lflag));
+                (void)console_tty_set_oflag(termios.c_oflag);
                 ret = 0u;
                 break;
             }

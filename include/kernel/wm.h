@@ -7,6 +7,7 @@
 #define WM_MAX_LINES 5u
 
 void wm_init(void);
+void wm_start_compositor(void);
 uint32_t wm_active(void);
 
 uint32_t wm_window_create(const char *title,

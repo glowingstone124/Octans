@@ -8,6 +8,9 @@
 
 #define SMP_MAX_CPUS 32u
 
+#define SMP_STR1(x) #x
+#define SMP_STR(x) SMP_STR1(x)
+
 static volatile uint32_t g_online_cpus;
 static volatile uint32_t g_target_cpus;
 static volatile uint32_t g_cpu_online[SMP_MAX_CPUS];
@@ -57,10 +60,41 @@ __asm__(
     ".text\n"
     ".globl smp_ap_bootstrap\n"
     "smp_ap_bootstrap:\n"
+    /* STARTAP enters with the VM's firmware stack bases.  Those bases are
+     * deliberately a VM implementation detail and may live above the
+     * kernel's fixed 64 MiB identity map when the VM is given extra RAM.
+     * Move every AP onto its kernel-owned reserved slot before the first
+     * CALL, so enabling paging cannot strand a scheduler return address in
+     * an unmapped firmware stack. */
     "  cpuid r0\n"
-    "  movi r1, 0x003FF000\n"
-    "  shli r2, r0, 12\n"
-    "  sub r30, r1, r2\n"
+    "  movi r1, " SMP_STR(VM_STACK_POOL_BASE) "\n"
+    "  movi r2, " SMP_STR(VM_STACK_SLOT_BYTES) "\n"
+    "  mul r2, r0, r2\n"
+    "  add r1, r1, r2\n"
+
+    "  movi r2, " SMP_STR(IO_CPU_CTX_CALL_BASE) "\n"
+    "  out r1, r2\n"
+    "  movi r3, " SMP_STR(VM_CALL_STACK_BYTES) "\n"
+    "  add r3, r1, r3\n"
+    "  movi r2, " SMP_STR(IO_CPU_CTX_DATA_BASE) "\n"
+    "  out r3, r2\n"
+    "  movi r4, " SMP_STR(VM_DATA_STACK_BYTES) "\n"
+    "  add r4, r3, r4\n"
+    "  movi r2, " SMP_STR(IO_CPU_CTX_ISR_BASE) "\n"
+    "  out r4, r2\n"
+
+    "  movi r3, " SMP_STR(VM_CALL_STACK_ENTRIES) "\n"
+    "  movi r2, " SMP_STR(IO_CPU_CTX_CSP) "\n"
+    "  out r3, r2\n"
+    "  movi r3, " SMP_STR(VM_DATA_STACK_ENTRIES) "\n"
+    "  movi r2, " SMP_STR(IO_CPU_CTX_DSP) "\n"
+    "  out r3, r2\n"
+    "  movi r3, " SMP_STR(VM_ISR_STACK_ENTRIES) "\n"
+    "  movi r2, " SMP_STR(IO_CPU_CTX_ISP) "\n"
+    "  out r3, r2\n"
+
+    "  movi r2, " SMP_STR(VM_STACK_SLOT_BYTES) "\n"
+    "  add r30, r1, r2\n"
     "  mov r31, r30\n"
     "  call smp_ap_entry\n"
     "smp_ap_bootstrap_halt:\n"

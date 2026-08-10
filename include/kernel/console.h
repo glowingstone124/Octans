@@ -14,6 +14,11 @@ enum {
     TTY_LFLAG_ISIG = (1u << 2)
 };
 
+enum {
+    TTY_OFLAG_OPOST = 0x0001u,
+    TTY_OFLAG_ONLCR = 0x0004u
+};
+
 void console_init(void);
 void console_rx_feed(uint8_t c);
 uint32_t console_rx_dropped(void);
@@ -23,6 +28,8 @@ int console_wait_readable(uint32_t timeout_ticks, uint32_t nonblock);
 
 uint32_t console_tty_get_lflag(void);
 uint32_t console_tty_set_lflag(uint32_t lflag);
+uint32_t console_tty_get_oflag(void);
+uint32_t console_tty_set_oflag(uint32_t oflag);
 
 int console_read(uint8_t *dst, uint32_t len, uint32_t nonblock);
 uint32_t console_write(const uint8_t *src, uint32_t len);

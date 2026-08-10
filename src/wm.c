@@ -6,6 +6,7 @@
 #include "../include/kernel/pci.h"
 #include "../include/kernel/platform.h"
 #include "../include/kernel/printk.h"
+#include "../include/kernel/sched.h"
 #include "../../include/lampvm/device_abi.h"
 
 #define WM_TAG "wm"
@@ -14,6 +15,10 @@
 #define WM_TITLEBAR_HEIGHT 30u
 #define WM_CURSOR_WIDTH 12u
 #define WM_CURSOR_HEIGHT 18u
+#define WM_CLICK_PENDING (1u << 31)
+#define WM_CLICK_X_MASK 0x3FFu
+#define WM_CLICK_Y_MASK 0x1FFu
+#define WM_CLICK_Y_SHIFT 10u
 
 #define COLOR_DESKTOP 0x00091420u
 #define COLOR_DESKTOP_ALT 0x000C1929u
@@ -53,6 +58,9 @@ static volatile uint32_t g_wm_active;
 static uint32_t g_double_buffered;
 static uint32_t g_hardware_cursor;
 static uint32_t g_scanout_offset;
+static volatile uint32_t g_redraw_pending;
+static volatile uint32_t g_click_event;
+static uint32_t g_compositor_started;
 
 /* The mouse IRQ is the sole writer. Keep the hardware cursor coordinates
  * independent from the compositor's long-lived kio lock. */
@@ -61,6 +69,33 @@ static volatile int32_t g_pointer_y;
 static volatile uint32_t g_pointer_buttons;
 static uint32_t g_pointer_under[WM_CURSOR_WIDTH * WM_CURSOR_HEIGHT];
 static uint32_t g_pointer_saved;
+
+static uint32_t wm_hit_test_locked(uint32_t x, uint32_t y);
+static void wm_raise_index_locked(uint32_t index);
+
+static inline uint32_t wm_atomic_exchange_u32(volatile uint32_t *ptr,
+                                               uint32_t value) {
+    uint32_t old;
+    __asm__ volatile (
+        "xchg %0, %1, %2, 0\n"
+        : "=&r"(old)
+        : "r"(ptr), "r"(value)
+        : "memory"
+    );
+    return old;
+}
+
+static void wm_queue_click_from_irq(uint32_t x, uint32_t y) {
+    const uint32_t event = WM_CLICK_PENDING |
+        (x & WM_CLICK_X_MASK) |
+        ((y & WM_CLICK_Y_MASK) << WM_CLICK_Y_SHIFT);
+
+    /* The pointer IRQ may interrupt code that owns kio_lock. Publishing one
+     * packed word keeps the hard-IRQ path non-blocking; the compositor claims
+     * it with XCHG. A second click may replace an unconsumed first click, which
+     * is preferable to ever stalling pointer motion in an IRQ. */
+    (void)wm_atomic_exchange_u32(&g_click_event, event);
+}
 
 static const char *const g_pointer_shape[WM_CURSOR_HEIGHT] = {
     "X...........",
@@ -303,6 +338,45 @@ static void wm_render_locked(void) {
     }
 }
 
+static void wm_request_redraw_locked(void) {
+    /* Protected by kio_lock(), which also serializes scene state. */
+    g_redraw_pending = 1u;
+}
+
+static void wm_compositor_task(sched_task_t *task, void *arg) {
+    (void)task;
+    (void)arg;
+    for (;;) {
+        const uint32_t click =
+            wm_atomic_exchange_u32(&g_click_event, 0u);
+        uint32_t redraw;
+        kio_lock();
+        redraw = g_redraw_pending;
+        g_redraw_pending = 0u;
+        if ((click & WM_CLICK_PENDING) != 0u) {
+            const uint32_t x = click & WM_CLICK_X_MASK;
+            const uint32_t y =
+                (click >> WM_CLICK_Y_SHIFT) & WM_CLICK_Y_MASK;
+            const uint32_t hit = wm_hit_test_locked(x, y);
+            if (hit != 0u && g_z_order[g_window_count - 1u] != hit - 1u) {
+                wm_raise_index_locked(hit - 1u);
+                redraw = 1u;
+            }
+        }
+        if (redraw != 0u) {
+            if (g_wm_active) {
+                wm_render_locked();
+            }
+            kio_unlock();
+            continue;
+        }
+        kio_unlock();
+        /* One tick is also the lost-wakeup bound: pointer IRQs never block on
+         * scheduler internals merely to request a visual focus change. */
+        sched_sleep_ticks(1u);
+    }
+}
+
 static uint32_t wm_window_create_locked(const char *title,
                                         uint32_t x, uint32_t y,
                                         uint32_t width, uint32_t height,
@@ -380,6 +454,9 @@ void wm_init(void) {
     g_double_buffered = console_fb_pci_active() &&
         LAMP_GPU_VRAM_SIZE >= FB_SIZE * 2u;
     g_hardware_cursor = gpu_cursor_available();
+    g_redraw_pending = 0u;
+    g_click_event = 0u;
+    g_compositor_started = 0u;
     g_pointer_x = (int32_t)(FB_WIDTH / 2u);
     g_pointer_y = (int32_t)(FB_HEIGHT / 2u);
     g_pointer_buttons = 0u;
@@ -434,6 +511,18 @@ void wm_init(void) {
     kio_unlock();
 
     KLOGI(WM_TAG, "desktop active; serial keyboard, PS/2 pointer");
+}
+
+void wm_start_compositor(void) {
+    if (!g_wm_active || g_compositor_started) {
+        return;
+    }
+    if (sched_spawn("wm-compositor", wm_compositor_task, 0) < 0) {
+        KLOGW(WM_TAG, "compositor task spawn failed");
+        return;
+    }
+    g_compositor_started = 1u;
+    KLOGI(WM_TAG, "compositor task started");
 }
 
 uint32_t wm_active(void) {
@@ -559,15 +648,9 @@ void wm_pointer_event(int32_t dx, int32_t dy, uint32_t buttons) {
             return;
         }
 
-        /* Only click policy needs the window/compositor lock. Cursor motion
-         * has already reached the independent plane before entering it. */
-        kio_lock();
-        hit = wm_hit_test_locked((uint32_t)next_x, (uint32_t)next_y);
-        if (hit != 0u && g_z_order[g_window_count - 1u] != hit - 1u) {
-            wm_raise_index_locked(hit - 1u);
-            wm_render_locked();
-        }
-        kio_unlock();
+        /* Window policy is a compositor operation. Never take kio_lock from
+         * the hard mouse IRQ: it may have interrupted the lock owner. */
+        wm_queue_click_from_irq((uint32_t)next_x, (uint32_t)next_y);
         return;
     }
 
@@ -592,7 +675,7 @@ void wm_pointer_event(int32_t dx, int32_t dy, uint32_t buttons) {
         if (hit != 0u && g_z_order[g_window_count - 1u] != hit - 1u) {
             g_pointer_buttons = buttons & 7u;
             wm_raise_index_locked(hit - 1u);
-            wm_render_locked();
+            wm_request_redraw_locked();
             kio_unlock();
             return;
         }

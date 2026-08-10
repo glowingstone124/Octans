@@ -17,6 +17,7 @@
 #include "../include/kernel/trap.h"
 #include "../include/kernel/types.h"
 #include "../include/kernel/vm_info.h"
+#include "../include/kernel/wm.h"
 #include "../include/kernel/panic.h"
 #include "../include/kernel/pci.h"
 #include "net/net.h"
@@ -71,6 +72,7 @@ void kernel_entry(void) {
     KLOGI("smp", "bsp online");
 
     sched_init();
+    wm_start_compositor();
     fs_init();
     init_task_spawn();
     smp_start_aps();
