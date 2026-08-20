@@ -14,6 +14,9 @@ enum {
     PROC_INO_VERSION = 6u,
     PROC_INO_LOADAVG = 7u,
     PROC_INO_LAMPVM = 8u,
+    PROC_INO_TASK_DIR = 0x40000000u,
+    PROC_INO_TASK_STAT = 0x80000000u,
+    PROC_INO_TASK_PID_MASK = 0x3FFFFFFFu,
     PROC_CONTENT_CAP = 12288u
 };
 
@@ -40,6 +43,29 @@ static const proc_entry_t g_proc_entries[] = {
     { PROC_INO_LOADAVG, "loadavg", SYS_DT_REG },
     { PROC_INO_LAMPVM, "lampvm", SYS_DT_REG }
 };
+
+static uint32_t proc_is_task_dir(uint32_t ino) {
+    return (ino & ~PROC_INO_TASK_PID_MASK) == PROC_INO_TASK_DIR;
+}
+
+static uint32_t proc_is_task_stat(uint32_t ino) {
+    return (ino & ~PROC_INO_TASK_PID_MASK) == PROC_INO_TASK_STAT;
+}
+
+static uint32_t proc_task_pid(uint32_t ino) {
+    return ino & PROC_INO_TASK_PID_MASK;
+}
+
+static uint32_t proc_directory_size(uint32_t ino) {
+    if (ino == PROC_INO_ROOT) {
+        return (uint32_t)(sizeof(g_proc_entries) / sizeof(g_proc_entries[0])) +
+               SCHED_MAX_TASKS;
+    }
+    if (proc_is_task_dir(ino)) {
+        return 3u; /* ., .., stat */
+    }
+    return 0u;
+}
 
 static inline uint32_t proc_read32(uint32_t addr) {
     return *(volatile uint32_t *)(uintptr_t)addr;
@@ -92,6 +118,106 @@ static void proc_buf_u64(proc_buffer_t *out, uint64_t value) {
     }
 }
 
+static void proc_buf_i32(proc_buffer_t *out, int32_t value) {
+    if (value < 0) {
+        proc_buf_putc(out, '-');
+        proc_buf_u64(out, (uint32_t)(-(value + 1)) + 1u);
+        return;
+    }
+    proc_buf_u64(out, (uint32_t)value);
+}
+
+static char proc_task_state(uint32_t state) {
+    switch (state) {
+        case SCHED_TASK_RUNNING:
+        case SCHED_TASK_RUNNABLE:
+            return 'R';
+        case SCHED_TASK_SLEEPING:
+            return 'S';
+        case SCHED_TASK_BLOCKED:
+            return 'D';
+        case SCHED_TASK_ZOMBIE:
+            return 'Z';
+        default:
+            return 'S';
+    }
+}
+
+static uint32_t proc_task_stat(uint32_t pid, char *dst, uint32_t capacity) {
+    sched_proc_task_info_t task;
+    proc_buffer_t out;
+    uint32_t page_count;
+    uint32_t virtual_size;
+
+    if (!dst || capacity == 0u || sched_proc_task_by_pid(pid, &task) != 0) {
+        return 0u;
+    }
+    out.data = dst;
+    out.capacity = capacity;
+    out.length = 0u;
+    out.data[0] = '\0';
+    page_count = (task.stack_bytes + 4095u) / 4096u;
+    virtual_size = task.kind == SCHED_TASK_KIND_USER ?
+        USER_REGION_SIZE : task.stack_bytes;
+
+    /* Linux-compatible field order through rss. */
+    proc_buf_u64(&out, task.pid);
+    proc_buf_puts(&out, " (");
+    proc_buf_puts(&out, task.name);
+    proc_buf_puts(&out, ") ");
+    proc_buf_putc(&out, proc_task_state(task.state));
+    proc_buf_putc(&out, ' ');
+    proc_buf_i32(&out, task.ppid);
+    proc_buf_putc(&out, ' ');
+    proc_buf_u64(&out, task.pid);     /* process group */
+    proc_buf_putc(&out, ' ');
+    proc_buf_u64(&out, task.pid);     /* session */
+    proc_buf_puts(&out, " 0 0 0 0 0 0 0 ");
+    proc_buf_u64(&out, task.run_ticks); /* utime */
+    proc_buf_puts(&out, " 0 0 0 20 0 1 0 0 ");
+    proc_buf_putc(&out, ' ');
+    proc_buf_u64(&out, virtual_size);
+    proc_buf_putc(&out, ' ');
+    proc_buf_u64(&out, page_count);
+    proc_buf_putc(&out, '\n');
+    return out.length;
+}
+
+static int proc_parse_task_path(const char *path,
+                                uint32_t *pid_out,
+                                const char **tail_out) {
+    const char *p;
+    uint32_t pid = 0u;
+
+    if (!path || path[0] != '/' || path[1] != 'p' || path[2] != 'r' ||
+        path[3] != 'o' || path[4] != 'c' || path[5] != '/') {
+        return 0;
+    }
+    p = path + 6u;
+    if (*p < '0' || *p > '9') {
+        return 0;
+    }
+    while (*p >= '0' && *p <= '9') {
+        const uint32_t digit = (uint32_t)(*p - '0');
+        if (pid > (PROC_INO_TASK_PID_MASK - digit) / 10u) {
+            return 0;
+        }
+        pid = pid * 10u + digit;
+        p++;
+    }
+    if (pid == 0u || sched_proc_task_by_pid(pid,
+                                             &(sched_proc_task_info_t){0}) != 0) {
+        return 0;
+    }
+    if (pid_out) {
+        *pid_out = pid;
+    }
+    if (tail_out) {
+        *tail_out = p;
+    }
+    return 1;
+}
+
 static void proc_buf_fixed3(proc_buffer_t *out, uint64_t milli_value) {
     proc_buf_u64(out, milli_value / 1000u);
     proc_buf_putc(out, '.');
@@ -118,12 +244,25 @@ static uint32_t proc_runtime_available(void) {
 
 static uint32_t proc_lookup(const char *path, uint32_t *is_dir) {
     const char *name;
+    const char *tail;
+    uint32_t pid;
     if (!path) return 0u;
     if (proc_str_eq(path, "/proc") || proc_str_eq(path, "/proc/")) {
         if (is_dir) *is_dir = 1u;
         return PROC_INO_ROOT;
     }
     if (!fs_proc_path_match(path)) return 0u;
+    if (proc_parse_task_path(path, &pid, &tail)) {
+        if (*tail == '\0' || proc_str_eq(tail, "/")) {
+            if (is_dir) *is_dir = 1u;
+            return PROC_INO_TASK_DIR | pid;
+        }
+        if (proc_str_eq(tail, "/stat")) {
+            if (is_dir) *is_dir = 0u;
+            return PROC_INO_TASK_STAT | pid;
+        }
+        return 0u;
+    }
     name = path + 6u;
     if (*name == '\0') {
         if (is_dir) *is_dir = 1u;
@@ -175,7 +314,6 @@ static void proc_memory_values(uint64_t *total_out, uint64_t *used_out,
     uint64_t kernel_reserved =
         ((uint64_t)(uintptr_t)__kernel_end + 4095u) & ~4095ull;
     uint64_t used;
-    uint64_t unavailable;
     sched_stats_snapshot(&stats);
     if (vm_info_load_boot(&boot) && boot.mem_bytes_hi == 0u) {
         total = boot.mem_bytes_lo;
@@ -184,13 +322,16 @@ static void proc_memory_values(uint64_t *total_out, uint64_t *used_out,
     if (stats.user_tasks != 0u) {
         used += USER_REGION_SIZE;
     }
-    unavailable = kernel_reserved + USER_REGION_SIZE + VM_STACK_POOL_BYTES;
     if (used > total) used = total;
-    if (unavailable > total) unavailable = total;
     if (total_out) *total_out = total;
     if (used_out) *used_out = used;
-    if (available_out) *available_out = total - unavailable;
+    if (available_out) *available_out = total - used;
     if (sched_out) *sched_out = stats;
+}
+
+void fs_proc_memory_snapshot(uint64_t *total_out, uint64_t *used_out,
+                             uint64_t *available_out) {
+    proc_memory_values(total_out, used_out, available_out, 0);
 }
 
 static void proc_build_meminfo(proc_buffer_t *out) {
@@ -204,6 +345,7 @@ static void proc_build_meminfo(proc_buffer_t *out) {
     proc_buf_kib_line(out, "MemAvailable", available);
     proc_buf_kib_line(out, "Buffers", 0u);
     proc_buf_kib_line(out, "Cached", 0u);
+    proc_buf_kib_line(out, "SReclaimable", 0u);
     proc_buf_kib_line(out, "KernelStack", stats.stack_bytes);
 }
 
@@ -322,6 +464,9 @@ static uint32_t proc_build(uint32_t ino, char *dst, uint32_t capacity) {
     out.capacity = capacity;
     out.length = 0u;
     out.data[0] = '\0';
+    if (proc_is_task_stat(ino)) {
+        return proc_task_stat(proc_task_pid(ino), dst, capacity);
+    }
     switch (ino) {
         case PROC_INO_CPUINFO: proc_build_cpuinfo(&out); break;
         case PROC_INO_MEMINFO: proc_build_meminfo(&out); break;
@@ -354,8 +499,7 @@ int fs_proc_open(const char *path, uint32_t flags) {
         (flags & (SYS_O_CREAT | SYS_O_TRUNC | SYS_O_APPEND)) != 0u) {
         return FS_ERR_ROFS;
     }
-    size = is_dir ?
-        (uint32_t)(sizeof(g_proc_entries) / sizeof(g_proc_entries[0])) :
+    size = is_dir ? proc_directory_size(ino) :
         proc_build(ino, scratch, (uint32_t)sizeof(scratch));
     return sched_fd_open_regular(flags & (SYS_O_ACCMODE | SYS_O_NONBLOCK),
                                  FS_BACKEND_PROC, ino, size, is_dir);
@@ -374,8 +518,7 @@ int fs_proc_stat(const char *path, fs_stat_t *st) {
     st->st_uid = 0u;
     st->st_gid = 0u;
     st->st_rdev = 0u;
-    st->st_size = is_dir ?
-        (uint32_t)(sizeof(g_proc_entries) / sizeof(g_proc_entries[0])) :
+    st->st_size = is_dir ? proc_directory_size(ino) :
         proc_build(ino, scratch, (uint32_t)sizeof(scratch));
     st->st_blksize = 4096u;
     st->st_blocks = (st->st_size + 511u) / 512u;
@@ -388,27 +531,80 @@ int fs_proc_getdents_fd(int32_t fd, fs_dirent_t *dst, uint32_t len) {
     uint32_t offset;
     uint32_t is_dir;
     const proc_entry_t *entry;
+    sched_proc_task_info_t task;
     uint32_t i;
     if (!dst || len < (uint32_t)sizeof(*dst)) return FS_ERR_INVAL;
     if (sched_fd_regular_get(fd, &backend, &ino, 0, &offset, &is_dir) !=
         SCHED_FD_OK) return FS_ERR_BADF;
-    if (backend != FS_BACKEND_PROC || ino != PROC_INO_ROOT) return FS_ERR_BADF;
+    if (backend != FS_BACKEND_PROC) return FS_ERR_BADF;
     if (!is_dir) return FS_ERR_NOTDIR;
-    if (offset >= (uint32_t)(sizeof(g_proc_entries) / sizeof(g_proc_entries[0]))) {
-        return 0;
+
+    if (proc_is_task_dir(ino)) {
+        static const proc_entry_t task_entries[] = {
+            { 0u, ".", SYS_DT_DIR },
+            { PROC_INO_ROOT, "..", SYS_DT_DIR },
+            { 0u, "stat", SYS_DT_REG }
+        };
+        const uint32_t pid = proc_task_pid(ino);
+        if (sched_proc_task_by_pid(pid, &task) != 0 ||
+            offset >= (uint32_t)(sizeof(task_entries) / sizeof(task_entries[0]))) {
+            return 0;
+        }
+        entry = &task_entries[offset];
+        dst->d_ino = entry->ino;
+        if (offset == 0u) dst->d_ino = ino;
+        if (offset == 2u) dst->d_ino = PROC_INO_TASK_STAT | pid;
+        dst->d_off = offset + 1u;
+        dst->d_reclen = (uint32_t)sizeof(*dst);
+        dst->d_type = entry->type;
+        for (i = 0u; i + 1u < (uint32_t)sizeof(dst->d_name) &&
+                      entry->name[i] != '\0'; i++) {
+            dst->d_name[i] = entry->name[i];
+        }
+        dst->d_name[i] = '\0';
+        (void)sched_fd_regular_advance(fd, 1u, 0);
+        return (int)sizeof(*dst);
     }
-    entry = &g_proc_entries[offset];
-    dst->d_ino = entry->ino;
-    dst->d_off = offset + 1u;
-    dst->d_reclen = (uint32_t)sizeof(*dst);
-    dst->d_type = entry->type;
-    for (i = 0u; i + 1u < (uint32_t)sizeof(dst->d_name) &&
-                  entry->name[i] != '\0'; i++) {
-        dst->d_name[i] = entry->name[i];
+
+    if (ino != PROC_INO_ROOT) return FS_ERR_BADF;
+    for (i = offset + 1u; i < SCHED_MAX_TASKS; i++) {
+        if (sched_proc_task_by_slot(i, &task) != 0) {
+            continue;
+        }
+        dst->d_ino = PROC_INO_TASK_DIR | task.pid;
+        dst->d_off = i;
+        dst->d_reclen = (uint32_t)sizeof(*dst);
+        dst->d_type = SYS_DT_DIR;
+        {
+            proc_buffer_t name_out = {
+                .data = dst->d_name,
+                .capacity = (uint32_t)sizeof(dst->d_name),
+                .length = 0u
+            };
+            dst->d_name[0] = '\0';
+            proc_buf_u64(&name_out, task.pid);
+        }
+        (void)sched_fd_regular_advance(fd, dst->d_off - offset, 0);
+        return (int)sizeof(*dst);
     }
-    dst->d_name[i] = '\0';
-    (void)sched_fd_regular_advance(fd, 1u, 0);
-    return (int)sizeof(*dst);
+
+    if (offset < SCHED_MAX_TASKS + (uint32_t)(sizeof(g_proc_entries) / sizeof(g_proc_entries[0]))) {
+        uint32_t static_index = offset < SCHED_MAX_TASKS ? 0u : offset - SCHED_MAX_TASKS;
+        entry = &g_proc_entries[static_index];
+        dst->d_ino = entry->ino;
+        dst->d_off = SCHED_MAX_TASKS + static_index + 1u;
+        dst->d_reclen = (uint32_t)sizeof(*dst);
+        dst->d_type = entry->type;
+        for (i = 0u; i + 1u < (uint32_t)sizeof(dst->d_name) &&
+                      entry->name[i] != '\0'; i++) {
+            dst->d_name[i] = entry->name[i];
+        }
+        dst->d_name[i] = '\0';
+        (void)sched_fd_regular_advance(fd, dst->d_off - offset, 0);
+        return (int)sizeof(*dst);
+    }
+
+    return 0;
 }
 
 int fs_proc_read_fd(int32_t fd, uint8_t *dst, uint32_t len) {

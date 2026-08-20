@@ -1,6 +1,7 @@
 #include "../include/kernel/blk.h"
 #include "../include/kernel/console.h"
 #include "../include/kernel/fs.h"
+#include "../include/kernel/fs_proc.h"
 #include "../include/kernel/irq.h"
 #include "../include/kernel/platform.h"
 #include "../include/kernel/printk.h"
@@ -56,6 +57,7 @@ enum {
     ERRNO_EINVAL = 22u,
     ERRNO_ERANGE = 34u,
     ERRNO_ENAMETOOLONG = 36u,
+    ERRNO_ENOTEMPTY = 39u,
     ERRNO_ENOTSOCK = 88u,
     ERRNO_EOPNOTSUPP = 95u,
     ERRNO_EAFNOSUPPORT = 97u,
@@ -79,6 +81,23 @@ typedef struct syscall_timeval32 {
     int32_t tv_sec;
     int32_t tv_usec;
 } syscall_timeval32_t;
+
+typedef struct syscall_sysinfo32 {
+    int32_t uptime;
+    uint32_t loads[3];
+    uint32_t totalram;
+    uint32_t freeram;
+    uint32_t sharedram;
+    uint32_t bufferram;
+    uint32_t totalswap;
+    uint32_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint32_t totalhigh;
+    uint32_t freehigh;
+    uint32_t mem_unit;
+    uint8_t reserved[8];
+} syscall_sysinfo32_t;
 
 enum {
     NS_PER_SEC = 1000000000u,
@@ -614,6 +633,9 @@ static uint32_t errno_from_fs_rc(int rc) {
     if (rc == FS_ERR_NOSYS) {
         return ERRNO_ENOSYS;
     }
+    if (rc == FS_ERR_NOTEMPTY) {
+        return ERRNO_ENOTEMPTY;
+    }
     if (rc == FS_ERR_ROFS) {
         return ERRNO_EROFS;
     }
@@ -826,6 +848,43 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
         case SYS_GETPPID:
             ret = (uint32_t)sched_current_ppid();
             break;
+        case SYS_SYSINFO: {
+            syscall_sysinfo32_t info;
+            sched_stats_t stats;
+            uint64_t totalram;
+            uint64_t usedram;
+            if (regs->arg0 == 0u) {
+                err = ERRNO_EFAULT;
+                ret = (uint32_t)-1;
+                break;
+            }
+            sched_stats_snapshot(&stats);
+            fs_proc_memory_snapshot(&totalram, &usedram, 0);
+            info.uptime = (int32_t)(((uint64_t)sched_ticks() *
+                                     sched_tick_period_us()) / US_PER_SEC);
+            info.loads[0] = (stats.running_tasks + stats.runnable_tasks) * 65536u;
+            info.loads[1] = info.loads[0];
+            info.loads[2] = info.loads[0];
+            info.totalram = totalram > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)totalram;
+            info.freeram = usedram < totalram ? (uint32_t)(totalram - usedram) : 0u;
+            info.sharedram = 0u;
+            info.bufferram = 0u;
+            info.totalswap = 0u;
+            info.freeswap = 0u;
+            info.procs = (uint16_t)stats.task_count;
+            info.pad = 0u;
+            info.totalhigh = 0u;
+            info.freehigh = 0u;
+            info.mem_unit = 1u;
+            for (uint32_t i = 0u; i < (uint32_t)sizeof(info.reserved); i++) info.reserved[i] = 0u;
+            if (!abi_user_write_bytes(regs->arg0, (const uint8_t *)&info, (uint32_t)sizeof(info))) {
+                err = ERRNO_EFAULT;
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = 0u;
+            break;
+        }
         case SYS_YIELD:
             sched_yield();
             ret = 0u;
@@ -1763,6 +1822,99 @@ uint32_t syscall_dispatch(const syscall_regs_t *regs) {
                 break;
             }
             ret = 0u;
+            break;
+        }
+        case SYS_UMASK:
+            if ((regs->arg0 & ~0777u) != 0u) {
+                err = ERRNO_EINVAL;
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = sched_current_umask(regs->arg0);
+            break;
+        case SYS_MKDIR: {
+            char path[FS_PATH_CAP];
+            int rc;
+            if (!syscall_read_resolved_path(regs->arg0, path, &err)) {
+                ret = (uint32_t)-1;
+                break;
+            }
+            rc = fs_mkdir(path, regs->arg1 & ~sched_current_umask_get());
+            if (rc != 0) {
+                err = errno_from_fs_rc(rc);
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = 0u;
+            break;
+        }
+        case SYS_RMDIR: {
+            char path[FS_PATH_CAP];
+            int rc;
+            if (!syscall_read_resolved_path(regs->arg0, path, &err)) {
+                ret = (uint32_t)-1;
+                break;
+            }
+            rc = fs_rmdir(path);
+            if (rc != 0) {
+                err = errno_from_fs_rc(rc);
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = 0u;
+            break;
+        }
+        case SYS_RENAME: {
+            char oldpath[FS_PATH_CAP];
+            char newpath[FS_PATH_CAP];
+            int rc;
+            if (!syscall_read_resolved_path(regs->arg0, oldpath, &err) ||
+                !syscall_read_resolved_path(regs->arg1, newpath, &err)) {
+                ret = (uint32_t)-1;
+                break;
+            }
+            rc = fs_rename(oldpath, newpath);
+            if (rc != 0) {
+                err = errno_from_fs_rc(rc);
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = 0u;
+            break;
+        }
+        case SYS_READLINK: {
+            char path[FS_PATH_CAP];
+            uint8_t target[FS_PATH_CAP];
+            uint32_t len = regs->arg2;
+            int rc;
+            if (!syscall_read_resolved_path(regs->arg0, path, &err)) {
+                ret = (uint32_t)-1;
+                break;
+            }
+            if (len == 0u) {
+                ret = 0u;
+                break;
+            }
+            if (regs->arg1 == 0u || !abi_ptr_range_ok(regs->arg1, len)) {
+                err = ERRNO_EFAULT;
+                ret = (uint32_t)-1;
+                break;
+            }
+            if (len > (uint32_t)sizeof(target)) {
+                len = (uint32_t)sizeof(target);
+            }
+            rc = fs_readlink(path, target, len);
+            if (rc < 0) {
+                err = errno_from_fs_rc(rc);
+                ret = (uint32_t)-1;
+                break;
+            }
+            if (!abi_user_write_bytes(regs->arg1, target, (uint32_t)rc)) {
+                err = ERRNO_EFAULT;
+                ret = (uint32_t)-1;
+                break;
+            }
+            ret = (uint32_t)rc;
             break;
         }
         case SYS_SOCKET: {

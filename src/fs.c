@@ -218,6 +218,42 @@ int fs_unlink(const char *path) {
     return fs_ext4_unlink(path);
 }
 
+int fs_mkdir(const char *path, uint32_t mode) {
+    if (!path || path[0] == '\0') {
+        return FS_ERR_INVAL;
+    }
+    if ((path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/') ||
+        fs_proc_path_match(path)) {
+        return FS_ERR_ROFS;
+    }
+    return fs_ext4_mkdir(path, mode);
+}
+
+int fs_rmdir(const char *path) {
+    if (!path || path[0] == '\0') {
+        return FS_ERR_INVAL;
+    }
+    if ((path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/') ||
+        fs_proc_path_match(path)) {
+        return FS_ERR_ROFS;
+    }
+    return fs_ext4_rmdir(path);
+}
+
+int fs_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || oldpath[0] == '\0' || !newpath || newpath[0] == '\0') {
+        return FS_ERR_INVAL;
+    }
+    if ((oldpath[0] == '/' && oldpath[1] == 'd' && oldpath[2] == 'e' && oldpath[3] == 'v' &&
+         oldpath[4] == '/') ||
+        (newpath[0] == '/' && newpath[1] == 'd' && newpath[2] == 'e' && newpath[3] == 'v' &&
+         newpath[4] == '/') ||
+        fs_proc_path_match(oldpath) || fs_proc_path_match(newpath)) {
+        return FS_ERR_ROFS;
+    }
+    return fs_ext4_rename(oldpath, newpath);
+}
+
 int fs_read(int32_t fd, uint8_t *dst, uint32_t len) {
     uint32_t t = SCHED_FD_TYPE_NONE;
     if (!dst || len == 0u) {

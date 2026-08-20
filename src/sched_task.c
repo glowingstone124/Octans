@@ -7,8 +7,23 @@
 static sched_stack_ctx_t g_vfork_discard_ctx[SCHED_MAX_CPUS];
 enum {
     SCHED_VFORK_SNAPSHOT_BASE = 0x01000000u,
-    SCHED_VFORK_IMAGE_SNAPSHOT_BYTES = 0x00100000u
+    /* Below the native stack/MMIO windows and above the current kernel BSS. */
+    SCHED_VFORK_STACK_SNAPSHOT_BASE = 0x00680000u,
+    /*
+     * execve may replace any non-stack page in the user region.  Snapshot the
+     * whole range instead of assuming that the current ELF, BSS, and heap fit
+     * in the first MiB.  Keep the user-stack snapshot separate: placing it
+     * after this range would overlap the kernel IRQ stack below 0x02000000.
+     */
+    SCHED_VFORK_IMAGE_SNAPSHOT_BYTES = USER_REGION_SIZE - USER_STACK_RESERVE
 };
+
+_Static_assert(SCHED_VFORK_SNAPSHOT_BASE + SCHED_VFORK_IMAGE_SNAPSHOT_BYTES <=
+                   KERNEL_IRQ_STACK_TOP - KERNEL_IRQ_STACK_BYTES,
+               "vfork image snapshot overlaps the kernel IRQ stack");
+_Static_assert(SCHED_VFORK_STACK_SNAPSHOT_BASE + USER_STACK_RESERVE <=
+                   SYSINFO_MMIO_BASE,
+               "vfork stack snapshot overlaps fixed MMIO");
 
 static uint32_t g_vfork_snapshot_valid;
 static uint32_t g_vfork_snapshot_child_tid;
@@ -151,7 +166,7 @@ static void sched_vfork_snapshot_parent_user_locked(sched_task_slot_t *child) {
     sched_mem_copy_u8(SCHED_VFORK_SNAPSHOT_BASE,
                       USER_REGION_BASE,
                       SCHED_VFORK_IMAGE_SNAPSHOT_BYTES);
-    sched_mem_copy_u8(SCHED_VFORK_SNAPSHOT_BASE + SCHED_VFORK_IMAGE_SNAPSHOT_BYTES,
+    sched_mem_copy_u8(SCHED_VFORK_STACK_SNAPSHOT_BASE,
                       USER_STACK_TOP - USER_STACK_RESERVE,
                       USER_STACK_RESERVE);
     g_vfork_snapshot_valid = 1u;
@@ -172,7 +187,7 @@ static void sched_vfork_restore_parent_user_locked(sched_task_slot_t *child) {
                       SCHED_VFORK_SNAPSHOT_BASE,
                       SCHED_VFORK_IMAGE_SNAPSHOT_BYTES);
     sched_mem_copy_u8(USER_STACK_TOP - USER_STACK_RESERVE,
-                      SCHED_VFORK_SNAPSHOT_BASE + SCHED_VFORK_IMAGE_SNAPSHOT_BYTES,
+                      SCHED_VFORK_STACK_SNAPSHOT_BASE,
                       USER_STACK_RESERVE);
     (void)mmu_map_identity(USER_REGION_BASE,
                            SCHED_VFORK_IMAGE_SNAPSHOT_BYTES,
@@ -1715,6 +1730,18 @@ uint32_t sched_current_umask(uint32_t new_mask) {
     }
     spinlock_unlock(&g_sched_lock);
     return old_mask;
+}
+
+uint32_t sched_current_umask_get(void) {
+    uint32_t mask = 022u;
+    sched_task_slot_t *slot;
+    spinlock_lock(&g_sched_lock);
+    slot = sched_current_slot();
+    if (slot && slot->used && !slot->is_idle) {
+        mask = slot->file_umask & 0777u;
+    }
+    spinlock_unlock(&g_sched_lock);
+    return mask;
 }
 
 void sched_vfork_release_parent(void) {

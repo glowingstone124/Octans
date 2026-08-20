@@ -750,6 +750,60 @@ void sched_stats_snapshot(sched_stats_t *out) {
     spinlock_unlock(&g_sched_lock);
 }
 
+static void sched_proc_task_copy(const sched_task_slot_t *slot,
+                                 sched_proc_task_info_t *out) {
+    uint32_t i;
+    const char *name;
+
+    out->pid = slot->pub.pid;
+    out->ppid = slot->pub.ppid;
+    out->state = slot->pub.state;
+    out->kind = slot->pub.kind;
+    out->run_ticks = slot->pub.run_ticks;
+    out->stack_bytes = slot->stack_ctx.valid ?
+        (uint32_t)VM_STACK_SLOT_BYTES : 0u;
+    name = slot->name ? slot->name : "task";
+    for (i = 0u; i + 1u < SCHED_NAME_MAX && name[i] != '\0'; i++) {
+        out->name[i] = name[i];
+    }
+    out->name[i] = '\0';
+}
+
+int sched_proc_task_by_slot(uint32_t slot_idx, sched_proc_task_info_t *out) {
+    int rc = -1;
+
+    if (!out || slot_idx == 0u || slot_idx >= SCHED_MAX_TASKS) {
+        return -1;
+    }
+    spinlock_lock(&g_sched_lock);
+    if (g_tasks[slot_idx].used && !g_tasks[slot_idx].is_idle) {
+        sched_proc_task_copy(&g_tasks[slot_idx], out);
+        rc = 0;
+    }
+    spinlock_unlock(&g_sched_lock);
+    return rc;
+}
+
+int sched_proc_task_by_pid(uint32_t pid, sched_proc_task_info_t *out) {
+    int rc = -1;
+
+    if (!out || pid == 0u) {
+        return -1;
+    }
+    spinlock_lock(&g_sched_lock);
+    for (uint32_t i = 1u; i < SCHED_MAX_TASKS; i++) {
+        if (!g_tasks[i].used || g_tasks[i].is_idle ||
+            g_tasks[i].pub.pid != pid) {
+            continue;
+        }
+        sched_proc_task_copy(&g_tasks[i], out);
+        rc = 0;
+        break;
+    }
+    spinlock_unlock(&g_sched_lock);
+    return rc;
+}
+
 int sched_current_tid(void) {
     int tid;
     sched_task_slot_t *slot;

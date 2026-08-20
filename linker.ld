@@ -46,4 +46,7 @@ SECTIONS
   }
 
   __kernel_end = .;
+
+  ASSERT(__kernel_end <= 0x00680000,
+         "kernel image overlaps vfork user-stack snapshot scratch")
 }

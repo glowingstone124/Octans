@@ -1478,6 +1478,126 @@ static int ext4_create_regular_locked(const char *path, uint32_t *out_ino) {
     return 0;
 }
 
+static int ext4_adjust_links_locked(uint32_t inode_no, int32_t delta) {
+    uint16_t links;
+    if (ext4_read_inode_locked(inode_no, g_inode_buf) != 0) {
+        return FS_ERR_IO;
+    }
+    links = ext4_inode_links_count(g_inode_buf);
+    if (delta < 0 && links < (uint16_t)(-delta)) {
+        return FS_ERR_IO;
+    }
+    links = (uint16_t)(links + delta);
+    wr_le16(&g_inode_buf[0x1Au], links);
+    return ext4_write_inode_locked(inode_no, g_inode_buf) == 0 ? 0 : FS_ERR_IO;
+}
+
+static int ext4_dir_is_empty_locked(uint32_t dir_ino) {
+    uint32_t dir_size;
+    uint32_t block_count;
+    int rc;
+    if (ext4_read_inode_locked(dir_ino, g_inode_buf) != 0) {
+        return FS_ERR_IO;
+    }
+    if ((ext4_inode_mode(g_inode_buf) & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+        return FS_ERR_NOTDIR;
+    }
+    rc = ext4_inode_size32(g_inode_buf, &dir_size);
+    if (rc != 0) {
+        return rc;
+    }
+    block_count = (dir_size + g_ext4.block_size - 1u) / g_ext4.block_size;
+    for (uint32_t lblock = 0u; lblock < block_count; lblock++) {
+        uint32_t pblock = 0u;
+        uint32_t pos = 0u;
+        rc = ext4_inode_map_block_locked(g_inode_buf, lblock, &pblock);
+        if (rc != 0 || ext4_read_block_locked(pblock, g_io_block) != 0) {
+            return rc != 0 ? rc : FS_ERR_IO;
+        }
+        while (pos + 8u <= g_ext4.block_size) {
+            uint32_t ino = rd_le32(&g_io_block[pos]);
+            uint16_t rec_len = rd_le16(&g_io_block[pos + 4u]);
+            uint8_t name_len = g_io_block[pos + 6u];
+            if (rec_len < 8u || pos + rec_len > g_ext4.block_size) {
+                return FS_ERR_IO;
+            }
+            if (ino != 0u &&
+                !((name_len == 1u && g_io_block[pos + 8u] == '.') ||
+                  (name_len == 2u && g_io_block[pos + 8u] == '.' &&
+                   g_io_block[pos + 9u] == '.'))) {
+                return FS_ERR_NOTEMPTY;
+            }
+            pos += rec_len;
+        }
+    }
+    return 0;
+}
+
+static int ext4_create_dir_locked(const char *path, uint32_t mode, uint32_t *out_ino) {
+    char parent[EXT4_PATH_CAP];
+    uint8_t name[EXT4_MAX_NAME];
+    uint32_t name_len = 0u;
+    uint32_t parent_ino = 0u;
+    uint32_t parent_size = 0u;
+    uint16_t parent_mode = 0u;
+    uint32_t new_ino = 0u;
+    int rc;
+
+    rc = ext4_split_parent_name(path, parent, name, &name_len);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = ext4_lookup_path_locked(parent, &parent_ino, &parent_mode, &parent_size);
+    if (rc != 0) {
+        return rc;
+    }
+    (void)parent_size;
+    if ((parent_mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+        return FS_ERR_NOTDIR;
+    }
+    rc = ext4_alloc_inode_locked((uint16_t)(EXT4_S_IFDIR | (mode & 0777u)), &new_ino);
+    if (rc != 0) {
+        return rc;
+    }
+    if (ext4_read_inode_locked(new_ino, g_inode_buf) != 0) {
+        return FS_ERR_IO;
+    }
+    wr_le16(&g_inode_buf[0x1Au], 2u);
+    if (ext4_write_inode_locked(new_ino, g_inode_buf) != 0) {
+        return FS_ERR_IO;
+    }
+    for (uint32_t i = 0u; i < g_ext4.block_size; i++) {
+        g_tree_block[i] = 0u;
+    }
+    wr_le32(&g_tree_block[0u], new_ino);
+    wr_le16(&g_tree_block[4u], 12u);
+    g_tree_block[6u] = 1u;
+    g_tree_block[7u] = 2u;
+    g_tree_block[8u] = '.';
+    wr_le32(&g_tree_block[12u], parent_ino);
+    wr_le16(&g_tree_block[16u], (uint16_t)(g_ext4.block_size - 12u));
+    g_tree_block[18u] = 2u;
+    g_tree_block[19u] = 2u;
+    g_tree_block[20u] = '.';
+    g_tree_block[21u] = '.';
+    rc = ext4_write_inode_data_locked(new_ino, 0u, g_tree_block, g_ext4.block_size, 0);
+    if (rc < 0 || (uint32_t)rc != g_ext4.block_size) {
+        return rc < 0 ? rc : FS_ERR_IO;
+    }
+    rc = ext4_dir_add_entry_locked(parent_ino, name, name_len, new_ino, 2u);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = ext4_adjust_links_locked(parent_ino, 1);
+    if (rc != 0) {
+        return rc;
+    }
+    if (out_ino) {
+        *out_ino = new_ino;
+    }
+    return 0;
+}
+
 static int ext4_try_probe_locked(void) {
     uint16_t magic;
     uint32_t log_block_size;
@@ -1990,6 +2110,203 @@ int fs_ext4_unlink(const char *path) {
         wr_le16(&g_inode_buf[0x00u], 0u);
         wr_le16(&g_inode_buf[0x1Au], 0u);
         (void)ext4_write_inode_locked(ino, g_inode_buf);
+    }
+    ext4_mutex_unlock();
+    return rc;
+}
+
+int fs_ext4_mkdir(const char *path, uint32_t mode) {
+    char normalized[EXT4_PATH_CAP];
+    uint32_t ino = 0u;
+    uint32_t size = 0u;
+    uint16_t inode_mode = 0u;
+    int rc;
+
+    if (!path || path[0] != '/') {
+        return FS_ERR_INVAL;
+    }
+    rc = ext4_path_normalize_absolute(path, normalized);
+    if (rc != 0) {
+        return rc;
+    }
+
+    ext4_mutex_lock();
+    rc = ext4_try_probe_locked();
+    if (rc == 0) {
+        rc = ext4_lookup_path_locked(normalized, &ino, &inode_mode, &size);
+        if (rc == 0) {
+            rc = FS_ERR_EXIST;
+        } else if (rc == FS_ERR_NOENT) {
+            rc = ext4_create_dir_locked(normalized, mode, 0);
+        }
+    }
+    ext4_mutex_unlock();
+    return rc;
+}
+
+int fs_ext4_rmdir(const char *path) {
+    char normalized[EXT4_PATH_CAP];
+    char parent[EXT4_PATH_CAP];
+    uint8_t name[EXT4_MAX_NAME];
+    uint32_t name_len = 0u;
+    uint32_t ino = 0u;
+    uint32_t size = 0u;
+    uint16_t mode = 0u;
+    uint32_t parent_ino = 0u;
+    uint32_t parent_size = 0u;
+    uint16_t parent_mode = 0u;
+    uint32_t removed_ino = 0u;
+    int rc;
+
+    if (!path || path[0] != '/') {
+        return FS_ERR_INVAL;
+    }
+    rc = ext4_path_normalize_absolute(path, normalized);
+    if (rc != 0) {
+        return rc;
+    }
+
+    ext4_mutex_lock();
+    rc = ext4_try_probe_locked();
+    if (rc == 0) {
+        rc = ext4_lookup_path_locked(normalized, &ino, &mode, &size);
+    }
+    if (rc == 0 && (mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+        rc = FS_ERR_NOTDIR;
+    }
+    if (rc == 0) {
+        rc = ext4_dir_is_empty_locked(ino);
+    }
+    if (rc == 0) {
+        rc = ext4_split_parent_name(normalized, parent, name, &name_len);
+    }
+    if (rc == 0) {
+        rc = ext4_lookup_path_locked(parent, &parent_ino, &parent_mode, &parent_size);
+        (void)parent_size;
+    }
+    if (rc == 0 && (parent_mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+        rc = FS_ERR_NOTDIR;
+    }
+    if (rc == 0) {
+        rc = ext4_dir_remove_entry_locked(parent_ino, name, name_len, &removed_ino);
+    }
+    if (rc == 0 && removed_ino != ino) {
+        rc = FS_ERR_IO;
+    }
+    if (rc == 0) {
+        rc = ext4_adjust_links_locked(parent_ino, -1);
+    }
+    if (rc == 0 && ext4_read_inode_locked(ino, g_inode_buf) == 0) {
+        wr_le16(&g_inode_buf[0x00u], 0u);
+        wr_le16(&g_inode_buf[0x1Au], 0u);
+        if (ext4_write_inode_locked(ino, g_inode_buf) != 0) {
+            rc = FS_ERR_IO;
+        }
+    }
+    ext4_mutex_unlock();
+    return rc;
+}
+
+int fs_ext4_rename(const char *oldpath, const char *newpath) {
+    char old_normalized[EXT4_PATH_CAP];
+    char new_normalized[EXT4_PATH_CAP];
+    char old_parent[EXT4_PATH_CAP];
+    char new_parent[EXT4_PATH_CAP];
+    uint8_t old_name[EXT4_MAX_NAME];
+    uint8_t new_name[EXT4_MAX_NAME];
+    uint32_t old_name_len = 0u;
+    uint32_t new_name_len = 0u;
+    uint32_t old_ino = 0u;
+    uint32_t old_size = 0u;
+    uint16_t old_mode = 0u;
+    uint32_t old_parent_ino = 0u;
+    uint32_t new_parent_ino = 0u;
+    uint32_t parent_size = 0u;
+    uint16_t parent_mode = 0u;
+    uint32_t new_ino = 0u;
+    uint32_t new_size = 0u;
+    uint16_t new_mode = 0u;
+    uint32_t removed_ino = 0u;
+    int rc;
+
+    if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') {
+        return FS_ERR_INVAL;
+    }
+    rc = ext4_path_normalize_absolute(oldpath, old_normalized);
+    if (rc == 0) {
+        rc = ext4_path_normalize_absolute(newpath, new_normalized);
+    }
+    if (rc != 0) {
+        return rc;
+    }
+    if (ext4_str_len_cap(old_normalized, EXT4_PATH_CAP) ==
+        ext4_str_len_cap(new_normalized, EXT4_PATH_CAP) &&
+        mem_eq_u8((const uint8_t *)old_normalized, (const uint8_t *)new_normalized,
+                  ext4_str_len_cap(old_normalized, EXT4_PATH_CAP) + 1u)) {
+        return 0;
+    }
+
+    ext4_mutex_lock();
+    rc = ext4_try_probe_locked();
+    if (rc == 0) {
+        rc = ext4_lookup_path_locked(old_normalized, &old_ino, &old_mode, &old_size);
+    }
+    if (rc == 0 && (old_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) {
+        rc = FS_ERR_NOSYS;
+    }
+    if (rc == 0) {
+        rc = ext4_split_parent_name(old_normalized, old_parent, old_name, &old_name_len);
+    }
+    if (rc == 0) {
+        rc = ext4_split_parent_name(new_normalized, new_parent, new_name, &new_name_len);
+    }
+    if (rc == 0) {
+        rc = ext4_lookup_path_locked(old_parent, &old_parent_ino, &parent_mode, &parent_size);
+        (void)parent_size;
+    }
+    if (rc == 0 && (parent_mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+        rc = FS_ERR_NOTDIR;
+    }
+    if (rc == 0) {
+        rc = ext4_lookup_path_locked(new_parent, &new_parent_ino, &parent_mode, &parent_size);
+        (void)parent_size;
+    }
+    if (rc == 0 && (parent_mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+        rc = FS_ERR_NOTDIR;
+    }
+    if (rc == 0) {
+        rc = ext4_lookup_path_locked(new_normalized, &new_ino, &new_mode, &new_size);
+        if (rc == FS_ERR_NOENT) {
+            rc = 0;
+        }
+    }
+    if (rc == 0 && new_ino == old_ino && new_ino != 0u) {
+        ext4_mutex_unlock();
+        return 0;
+    }
+    if (rc == 0 && new_ino != 0u) {
+        if ((new_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) {
+            rc = FS_ERR_ISDIR;
+        } else {
+            rc = ext4_dir_remove_entry_locked(new_parent_ino, new_name, new_name_len, &removed_ino);
+            if (rc == 0 && removed_ino == new_ino && ext4_read_inode_locked(new_ino, g_inode_buf) == 0) {
+                wr_le16(&g_inode_buf[0x00u], 0u);
+                wr_le16(&g_inode_buf[0x1Au], 0u);
+                if (ext4_write_inode_locked(new_ino, g_inode_buf) != 0) {
+                    rc = FS_ERR_IO;
+                }
+            }
+        }
+    }
+    if (rc == 0) {
+        rc = ext4_dir_add_entry_locked(new_parent_ino, new_name, new_name_len, old_ino,
+                                       (old_mode & EXT4_S_IFMT) == EXT4_S_IFLNK ? 7u : 1u);
+    }
+    if (rc == 0) {
+        rc = ext4_dir_remove_entry_locked(old_parent_ino, old_name, old_name_len, &removed_ino);
+    }
+    if (rc == 0 && removed_ino != old_ino) {
+        rc = FS_ERR_IO;
     }
     ext4_mutex_unlock();
     return rc;

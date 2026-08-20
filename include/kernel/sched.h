@@ -37,6 +37,18 @@ enum {
     SCHED_CWD_CAP = 64u
 };
 
+/* Read-only task view used by procfs.  The scheduler owns task lifetime; this
+ * snapshot deliberately contains no mutable task pointers. */
+typedef struct sched_proc_task_info {
+    uint32_t pid;
+    int32_t ppid;
+    uint32_t state;
+    uint32_t kind;
+    uint32_t run_ticks;
+    uint32_t stack_bytes;
+    char name[SCHED_NAME_MAX];
+} sched_proc_task_info_t;
+
 enum {
     SCHED_SIGNAL_MAX = 31u,
     SCHED_SIGNAL_DFL = 0u,
@@ -164,6 +176,7 @@ int sched_current_ppid(void);
 int sched_current_getcwd(char *dst, uint32_t cap);
 int sched_current_setcwd(const char *path);
 uint32_t sched_current_umask(uint32_t new_mask);
+uint32_t sched_current_umask_get(void);
 uint32_t sched_tick_period_us(void);
 int sched_waitpid(int32_t pid, uint32_t options, uint32_t *status_out);
 int sched_vfork(uint32_t abi_addr);
@@ -222,5 +235,7 @@ void sched_run(void);
 void schedule_tick(void);
 unsigned int sched_ticks(void);
 void sched_stats_snapshot(sched_stats_t *out);
+int sched_proc_task_by_slot(uint32_t slot, sched_proc_task_info_t *out);
+int sched_proc_task_by_pid(uint32_t pid, sched_proc_task_info_t *out);
 
 #endif

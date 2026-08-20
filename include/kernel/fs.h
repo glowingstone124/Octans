@@ -16,6 +16,7 @@ enum {
     FS_ERR_ROFS = -30,
     FS_ERR_NAMETOOLONG = -36,
     FS_ERR_NOSYS = -38,
+    FS_ERR_NOTEMPTY = -39,
     FS_ERR_LOOP = -40
 };
 
@@ -53,6 +54,9 @@ int fs_fstat(int32_t fd, fs_stat_t *st);
 int fs_getdents(int32_t fd, fs_dirent_t *dst, uint32_t len);
 int fs_readlink(const char *path, uint8_t *dst, uint32_t len);
 int fs_unlink(const char *path);
+int fs_mkdir(const char *path, uint32_t mode);
+int fs_rmdir(const char *path);
+int fs_rename(const char *oldpath, const char *newpath);
 int fs_read(int32_t fd, uint8_t *dst, uint32_t len);
 int fs_write(int32_t fd, const uint8_t *src, uint32_t len);
 

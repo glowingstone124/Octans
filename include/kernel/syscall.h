@@ -55,7 +55,8 @@ enum {
     SYS_LINK = 48u,
     SYS_SYMLINK = 49u,
     SYS_READLINK = 50u,
-    SYS_SIGRETURN = 51u
+    SYS_SIGRETURN = 51u,
+    SYS_SYSINFO = 52u
 };
 
 enum {
